@@ -10,7 +10,11 @@ use ratatui::{
 
 use crate::app::App;
 use crate::data::{DiagnosisVerdict, PipelineCycle, PipelineSummary, Severity};
-use super::format_duration;
+use crate::format::format_duration;
+use crate::thresholds::{
+    self, CAUSE_ICONS, MAX_SLOW_TURNS_PER_CAUSE, MAX_DETECTED_DELAYS,
+    cause_label, cause_hint,
+};
 
 pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
@@ -131,16 +135,8 @@ fn render_diagnosis(frame: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(""));
     }
 
-    // Breakdown by cause
-    let cause_icons = [
-        ("LLM", "[LLM]"),
-        ("TTS", "[TTS]"),
-        ("TOOL", "[TOOL]"),
-        ("STT", "[STT]"),
-        ("OVERHEAD", "[GAP]"),
-    ];
-
-    for (cause, icon) in &cause_icons {
+    // Breakdown by cause (using centralized constants)
+    for (cause, icon) in CAUSE_ICONS {
         if let Some(turns) = diagnosis.slow_turns_by_cause.get(*cause) {
             if turns.is_empty() {
                 continue;
@@ -152,26 +148,13 @@ fn render_diagnosis(frame: &mut Frame, app: &App, area: Rect) {
                 _ => Color::Yellow,
             };
 
-            let cause_label = match *cause {
-                "OVERHEAD" => "PROCESSING GAPS",
-                other => other,
-            };
-
-            let cause_hint = match *cause {
-                "OVERHEAD" => " (time between stages, streaming, network)",
-                "LLM" => " (model inference)",
-                "TTS" => " (speech synthesis)",
-                "TOOL" => " (function execution)",
-                _ => "",
-            };
-
             lines.push(Line::from(vec![
-                Span::styled(format!("  {} {}: ", icon, cause_label), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("  {} {}: ", icon, cause_label(cause)), Style::default().fg(color).add_modifier(Modifier::BOLD)),
                 Span::styled(format!("{} slow turns", turns.len()), Style::default().fg(color)),
-                Span::styled(cause_hint, Style::default().fg(Color::DarkGray)),
+                Span::styled(cause_hint(cause), Style::default().fg(Color::DarkGray)),
             ]));
 
-            for t in turns.iter().take(3) {
+            for t in turns.iter().take(MAX_SLOW_TURNS_PER_CAUSE) {
                 let tool_info = t.tool_name.as_ref().map(|n| format!(" [tool: {}]", n)).unwrap_or_default();
 
                 // Show breakdown: E2E = LLM + TTS + gaps
@@ -180,14 +163,14 @@ fn render_diagnosis(frame: &mut Frame, app: &App, area: Rect) {
                     Span::styled(format!("    Turn {}: ", t.turn), Style::default().fg(color)),
                     Span::styled(format!("{:.1}s total", t.e2e_ms / 1000.0), Style::default().fg(Color::White)),
                     Span::styled(" = ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(format!("LLM {:.1}s", t.llm_ms / 1000.0), Style::default().fg(if t.llm_ms > 2000.0 { Color::Red } else { Color::Gray })),
+                    Span::styled(format!("LLM {:.1}s", t.llm_ms / 1000.0), Style::default().fg(llm_color(t.llm_ms))),
                     Span::styled(" + ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(format!("TTS {:.1}s", t.tts_ms / 1000.0), Style::default().fg(if t.tts_ms > 3000.0 { Color::Red } else { Color::Gray })),
-                    Span::styled(format!(" + gaps {:.1}s", gap_ms / 1000.0), Style::default().fg(if gap_ms > 1000.0 { Color::Yellow } else { Color::DarkGray })),
+                    Span::styled(format!("TTS {:.1}s", t.tts_ms / 1000.0), Style::default().fg(tts_color(t.tts_ms))),
+                    Span::styled(format!(" + gaps {:.1}s", gap_ms / 1000.0), Style::default().fg(if gap_ms > thresholds::GAP_SIGNIFICANT_MS * 2.0 { Color::Yellow } else { Color::DarkGray })),
                     Span::styled(tool_info, Style::default().fg(Color::Magenta)),
                 ]));
 
-                let preview = super::truncate(&t.text, 50);
+                let preview = crate::format::truncate(&t.text, thresholds::TEXT_PREVIEW_SHORT);
                 lines.push(Line::from(vec![
                     Span::styled(format!("      \"{}\"", preview), Style::default().fg(Color::DarkGray)),
                 ]));
@@ -320,7 +303,7 @@ fn generate_pipeline_summary(cycles: &[PipelineCycle]) -> Vec<Line<'static>> {
             Span::styled("  Detected delays:", Style::default().fg(Color::Yellow)),
         ]));
 
-        for delay in summary.detected_delays.iter().take(3) {
+        for delay in summary.detected_delays.iter().take(MAX_DETECTED_DELAYS) {
             let reason_color = if delay.is_tool_related { Color::Magenta } else { Color::Yellow };
             lines.push(Line::from(vec![
                 Span::styled(format!("    Turn {}: ", delay.turn_number), Style::default().fg(Color::Gray)),
@@ -330,9 +313,9 @@ fn generate_pipeline_summary(cycles: &[PipelineCycle]) -> Vec<Line<'static>> {
             ]));
         }
 
-        if summary.detected_delays.len() > 3 {
+        if summary.detected_delays.len() > MAX_DETECTED_DELAYS {
             lines.push(Line::from(vec![
-                Span::styled(format!("    ... and {} more", summary.detected_delays.len() - 3), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("    ... and {} more", summary.detected_delays.len() - MAX_DETECTED_DELAYS), Style::default().fg(Color::DarkGray)),
             ]));
         }
     }
@@ -342,46 +325,22 @@ fn generate_pipeline_summary(cycles: &[PipelineCycle]) -> Vec<Line<'static>> {
 
 /// Color for User→LLM delay (perception delay).
 fn user_to_llm_color(ms: f64) -> Color {
-    if ms < 100.0 {
-        Color::Green
-    } else if ms < 200.0 {
-        Color::Yellow
-    } else {
-        Color::Red
-    }
+    severity_color(thresholds::perception_severity(ms))
 }
 
 /// Color for LLM latency.
 fn llm_color(ms: f64) -> Color {
-    if ms < 1500.0 {
-        Color::Green
-    } else if ms < 3000.0 {
-        Color::Yellow
-    } else {
-        Color::Red
-    }
+    severity_color(thresholds::llm_severity(ms))
 }
 
 /// Color for TTS latency.
 fn tts_color(ms: f64) -> Color {
-    if ms < 2000.0 {
-        Color::Green
-    } else if ms < 4000.0 {
-        Color::Yellow
-    } else {
-        Color::Red
-    }
+    severity_color(thresholds::tts_severity(ms))
 }
 
 /// Color for total latency.
 fn total_color(ms: f64) -> Color {
-    if ms < 4000.0 {
-        Color::Green
-    } else if ms < 8000.0 {
-        Color::Yellow
-    } else {
-        Color::Red
-    }
+    severity_color(thresholds::total_severity(ms))
 }
 
 /// Render the pipeline analysis section with per-turn breakdown.

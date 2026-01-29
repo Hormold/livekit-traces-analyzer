@@ -6,6 +6,7 @@ use anyhow::Result;
 
 use crate::analysis::analyze_call;
 use crate::data::{CallAnalysis, LatencyStats, LogEntry, Span};
+use crate::thresholds;
 
 /// Available views in the TUI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,22 +217,8 @@ impl App {
     pub fn load(folder: &Path) -> Result<Self> {
         let analysis = analyze_call(folder)?;
 
-        // Compute latency stats
-        let e2e_values: Vec<f64> = analysis
-            .assistant_turns()
-            .iter()
-            .filter_map(|t| t.metrics.e2e_latency)
-            .collect();
-        let llm_values: Vec<f64> = analysis
-            .assistant_turns()
-            .iter()
-            .filter_map(|t| t.metrics.llm_node_ttft)
-            .collect();
-        let tts_values: Vec<f64> = analysis
-            .assistant_turns()
-            .iter()
-            .filter_map(|t| t.metrics.tts_node_ttfb)
-            .collect();
+        // Compute latency stats using centralized method
+        let (e2e_stats, llm_stats, tts_stats) = analysis.compute_latency_stats();
 
         Ok(Self {
             analysis,
@@ -246,9 +233,9 @@ impl App {
             log_filter: LogFilter::All,
             span_filter: SpanFilter::KeySpans,
             latency_sort: LatencySortMode::ByLatency,
-            e2e_stats: LatencyStats::from_values(&e2e_values),
-            llm_stats: LatencyStats::from_values(&llm_values),
-            tts_stats: LatencyStats::from_values(&tts_values),
+            e2e_stats,
+            llm_stats,
+            tts_stats,
         })
     }
 
@@ -268,23 +255,12 @@ impl App {
 
     /// Get filtered spans based on current filter.
     pub fn filtered_spans(&self) -> Vec<&Span> {
-        const KEY_SPAN_NAMES: &[&str] = &[
-            "agent_turn",
-            "user_turn",
-            "llm_node",
-            "tts_request",
-            "tts_node",
-            "stt_request",
-            "function_call",
-            "tool_call",
-        ];
-
         match self.span_filter {
             SpanFilter::KeySpans => self
                 .analysis
                 .spans
                 .iter()
-                .filter(|s| KEY_SPAN_NAMES.contains(&s.name.as_str()))
+                .filter(|s| thresholds::is_key_span(&s.name))
                 .collect(),
             SpanFilter::AllSpans => self.analysis.spans.iter().collect(),
         }

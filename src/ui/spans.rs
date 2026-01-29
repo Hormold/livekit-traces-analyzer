@@ -1,4 +1,4 @@
-//! Spans timeline view with detail panel.
+//! Spans timeline view with pipeline analysis and detail panel.
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -9,7 +9,9 @@ use ratatui::{
 };
 
 use crate::app::App;
-use super::{format_duration, latency_color};
+use crate::data::PipelineSummary;
+use crate::thresholds;
+use super::{format_duration, latency_color, severity_to_color};
 
 pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     let filtered = app.filtered_spans();
@@ -23,17 +25,131 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    // Split: table and detail view
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(45),  // Table
-            Constraint::Min(0),          // Detail view
-        ])
-        .split(area);
+    // Split: pipeline analysis, table, and detail view
+    let has_pipeline = !app.analysis.pipeline_cycles.is_empty();
 
-    render_table(frame, app, &filtered, chunks[0]);
-    render_detail(frame, app, &filtered, chunks[1]);
+    let chunks = if has_pipeline {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(10), // Pipeline analysis
+                Constraint::Percentage(35), // Table
+                Constraint::Min(0),    // Detail view
+            ])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(45), // Table
+                Constraint::Min(0),         // Detail view
+            ])
+            .split(area)
+    };
+
+    if has_pipeline {
+        render_pipeline_analysis(frame, app, chunks[0]);
+        render_table(frame, app, &filtered, chunks[1]);
+        render_detail(frame, app, &filtered, chunks[2]);
+    } else {
+        render_table(frame, app, &filtered, chunks[0]);
+        render_detail(frame, app, &filtered, chunks[1]);
+    }
+}
+
+/// Render the pipeline analysis panel showing per-turn timing breakdown.
+fn render_pipeline_analysis(frame: &mut Frame, app: &App, area: Rect) {
+    let cycles = &app.analysis.pipeline_cycles;
+
+    if cycles.is_empty() {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Pipeline Analysis ");
+        let paragraph = Paragraph::new("  No pipeline data").block(block);
+        frame.render_widget(paragraph, area);
+        return;
+    }
+
+    let summary = PipelineSummary::from_cycles(cycles);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    if let Some(ref s) = summary {
+        // Line 1: Response time summary
+        let total_color = severity_to_color(s.total_severity);
+        lines.push(Line::from(vec![
+            TextSpan::styled("Response: ", Style::default().fg(Color::White)),
+            TextSpan::styled(format!("{:.0}ms avg", s.avg_total_ms), Style::default().fg(total_color).add_modifier(Modifier::BOLD)),
+            TextSpan::styled(format!(" (max {:.0}ms)", s.max_total_ms), Style::default().fg(Color::DarkGray)),
+            TextSpan::styled(format!(" - {}", s.total_verdict), Style::default().fg(total_color)),
+        ]));
+
+        // Line 2: LLM breakdown
+        let llm_color = severity_to_color(s.llm_severity);
+        lines.push(Line::from(vec![
+            TextSpan::styled("  LLM: ", Style::default().fg(Color::Yellow)),
+            TextSpan::styled(format!("{:.0}ms", s.avg_llm_ms), Style::default().fg(llm_color)),
+            TextSpan::styled(format!(" ({:.0}%)", s.llm_pct), Style::default().fg(Color::DarkGray)),
+            TextSpan::styled(format!(" - {}", s.llm_verdict), Style::default().fg(llm_color)),
+        ]));
+
+        // Line 3: TTS breakdown
+        let tts_color = severity_to_color(s.tts_severity);
+        lines.push(Line::from(vec![
+            TextSpan::styled("  TTS: ", Style::default().fg(Color::Magenta)),
+            TextSpan::styled(format!("{:.0}ms", s.avg_tts_ms), Style::default().fg(tts_color)),
+            TextSpan::styled(format!(" ({:.0}%)", s.tts_pct), Style::default().fg(Color::DarkGray)),
+            TextSpan::styled(format!(" - {}", s.tts_verdict), Style::default().fg(tts_color)),
+        ]));
+
+        // Line 4: Perception delay (only if we have user turns)
+        if s.user_turn_count > 0 {
+            let perception_color = severity_to_color(s.perception_severity);
+            lines.push(Line::from(vec![
+                TextSpan::styled("  VAD: ", Style::default().fg(Color::Cyan)),
+                TextSpan::styled(format!("{:.0}ms", s.avg_user_to_llm_ms), Style::default().fg(perception_color)),
+                TextSpan::styled(format!(" ({} user turns)", s.user_turn_count), Style::default().fg(Color::DarkGray)),
+                TextSpan::styled(format!(" - {}", s.perception_verdict), Style::default().fg(perception_color)),
+            ]));
+        }
+
+        // Line 5: Bottleneck
+        let bottleneck_color = severity_to_color(s.bottleneck_severity);
+        lines.push(Line::from(vec![
+            TextSpan::styled("Bottleneck: ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            TextSpan::styled(&s.bottleneck, Style::default().fg(bottleneck_color)),
+        ]));
+
+        // Line 6: Detected delays (if any)
+        if !s.detected_delays.is_empty() {
+            let delay_count = s.detected_delays.len().min(thresholds::MAX_DETECTED_DELAYS);
+            let delays: Vec<String> = s.detected_delays.iter()
+                .take(delay_count)
+                .map(|d| format!("T{}:{:.0}ms({})", d.turn_number, d.gap_ms, d.reason))
+                .collect();
+            lines.push(Line::from(vec![
+                TextSpan::styled("Delays: ", Style::default().fg(Color::Red)),
+                TextSpan::styled(delays.join(" | "), Style::default().fg(Color::Yellow)),
+            ]));
+        }
+    } else {
+        lines.push(Line::from(TextSpan::styled(
+            "No pipeline data available",
+            Style::default().fg(Color::DarkGray)
+        )));
+    }
+
+    let title = format!(" Pipeline Analysis ({} turns) ", cycles.len());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(title);
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(paragraph, area);
 }
 
 fn render_table(frame: &mut Frame, app: &App, filtered: &[&crate::data::Span], area: Rect) {

@@ -273,7 +273,11 @@ pub const CAUSE_ICONS: &[(&str, &str)] = &[
 pub fn cause_label(cause: &str) -> &'static str {
     match cause {
         "OVERHEAD" => "PROCESSING GAPS",
-        other => other,
+        "LLM" => "LLM",
+        "TTS" => "TTS",
+        "TOOL" => "TOOL",
+        "STT" => "STT",
+        _ => "UNKNOWN",
     }
 }
 

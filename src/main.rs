@@ -4,8 +4,12 @@ mod analysis;
 mod app;
 mod data;
 mod events;
+mod format;
+mod input;
 mod parser;
+mod pcap;
 mod report;
+mod thresholds;
 mod ui;
 
 use std::env;
@@ -29,7 +33,8 @@ use report::{generate_json_report, generate_text_report, generate_text_report_no
 
 /// Command line options.
 struct CliOptions {
-    folder: PathBuf,
+    /// Input paths (folders, ZIPs, or PCAPs)
+    inputs: Vec<PathBuf>,
     report_mode: ReportMode,
     output_file: Option<PathBuf>,
 }
@@ -40,23 +45,45 @@ enum ReportMode {
     Tui,
     Text,
     Json,
+    Summary,
+    Logs,
+    Spans,
+    Transcript,
+    Dump,
+    Pcap,
 }
 
 fn print_usage(program: &str) {
-    eprintln!("Usage: {} [OPTIONS] <observability_folder>", program);
+    eprintln!("Usage: {} [OPTIONS] <input> [<input>...]", program);
     eprintln!();
     eprintln!("Interactive TUI for analyzing LiveKit call observability data.");
     eprintln!();
-    eprintln!("Options:");
-    eprintln!("  -r, --report        Output text report to stdout (no TUI)");
-    eprintln!("  --json              Output JSON report to stdout (no TUI)");
+    eprintln!("Supported Inputs:");
+    eprintln!("  folder/             Observability folder (logs.json, spans.json)");
+    eprintln!("  file.zip            ZIP archive (auto-extracts)");
+    eprintln!("  file.pcap           Network capture (SIP/RTP analysis)");
+    eprintln!();
+    eprintln!("Output Formats:");
+    eprintln!("  (default)           Interactive TUI");
+    eprintln!("  -r, --report        Full text report (human-readable)");
+    eprintln!("  --json              Structured JSON report");
+    eprintln!("  --summary           Key metrics only (agent-friendly, key=value)");
+    eprintln!("  --logs              All logs with timestamps");
+    eprintln!("  --spans             All spans with timing");
+    eprintln!("  --transcript        Conversation transcript only");
+    eprintln!("  --dump              Everything: summary + transcript + logs + spans");
+    eprintln!("  --pcap              PCAP analysis only (SIP/RTP)");
+    eprintln!();
+    eprintln!("Other Options:");
     eprintln!("  -o, --output <file> Write report to file instead of stdout");
     eprintln!("  -h, --help          Show this help message");
     eprintln!();
     eprintln!("Examples:");
-    eprintln!("  {} ../observability-RM_3hhNSntAu8JG", program);
-    eprintln!("  {} -r ../observability-RM_3hhNSntAu8JG", program);
-    eprintln!("  {} --json -o report.json ../observability-RM_3hhNSntAu8JG", program);
+    eprintln!("  {} ./observability-RM_xxx", program);
+    eprintln!("  {} ./traces.zip", program);
+    eprintln!("  {} ./traces.zip ./call.pcap", program);
+    eprintln!("  {} --summary ./observability-RM_xxx", program);
+    eprintln!("  {} --dump ./traces.zip", program);
 }
 
 fn parse_args() -> Result<CliOptions, String> {
@@ -65,7 +92,7 @@ fn parse_args() -> Result<CliOptions, String> {
 
     let mut report_mode = ReportMode::Tui;
     let mut output_file: Option<PathBuf> = None;
-    let mut folder: Option<PathBuf> = None;
+    let mut inputs: Vec<PathBuf> = Vec::new();
 
     let mut i = 1;
     while i < args.len() {
@@ -81,6 +108,24 @@ fn parse_args() -> Result<CliOptions, String> {
             "--json" => {
                 report_mode = ReportMode::Json;
             }
+            "--summary" => {
+                report_mode = ReportMode::Summary;
+            }
+            "--logs" => {
+                report_mode = ReportMode::Logs;
+            }
+            "--spans" => {
+                report_mode = ReportMode::Spans;
+            }
+            "--transcript" => {
+                report_mode = ReportMode::Transcript;
+            }
+            "--dump" => {
+                report_mode = ReportMode::Dump;
+            }
+            "--pcap" => {
+                report_mode = ReportMode::Pcap;
+            }
             "-o" | "--output" => {
                 i += 1;
                 if i >= args.len() {
@@ -92,19 +137,18 @@ fn parse_args() -> Result<CliOptions, String> {
                 return Err(format!("Unknown option: {}", arg));
             }
             _ => {
-                if folder.is_some() {
-                    return Err("Multiple folders specified".to_string());
-                }
-                folder = Some(PathBuf::from(arg));
+                inputs.push(PathBuf::from(arg));
             }
         }
         i += 1;
     }
 
-    let folder = folder.ok_or_else(|| "No observability folder specified".to_string())?;
+    if inputs.is_empty() {
+        return Err("No input specified".to_string());
+    }
 
     Ok(CliOptions {
-        folder,
+        inputs,
         report_mode,
         output_file,
     })
@@ -122,33 +166,46 @@ fn main() -> Result<()> {
         }
     };
 
-    if !options.folder.exists() {
-        eprintln!("Error: Folder not found: {}", options.folder.display());
-        std::process::exit(1);
+    // Prepare inputs (auto-detect type, extract ZIPs, etc.)
+    let prepared = input::prepare_input(&options.inputs)
+        .with_context(|| "Failed to prepare input")?;
+
+    // Handle PCAP-only mode
+    if options.report_mode == ReportMode::Pcap {
+        if let Some(ref pcap_path) = prepared.pcap_file {
+            let pcap_analysis = pcap::parse_pcap(pcap_path)
+                .with_context(|| format!("Failed to parse PCAP: {}", pcap_path.display()))?;
+            let report = pcap::generate_pcap_report(&pcap_analysis);
+            output_report(&report, &options.output_file)?;
+            return Ok(());
+        } else {
+            eprintln!("Error: --pcap requires a PCAP file input");
+            std::process::exit(1);
+        }
     }
 
-    if !options.folder.is_dir() {
-        eprintln!("Error: Path is not a directory: {}", options.folder.display());
-        std::process::exit(1);
-    }
+    // We need traces for other modes
+    let traces_folder = prepared.traces_folder.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("No traces folder found. Provide a folder or ZIP with logs.json/spans.json"))?;
 
     // Handle report mode vs TUI mode
     match options.report_mode {
         ReportMode::Tui => {
             // Load and analyze the data for TUI
-            let app = App::load(&options.folder)
-                .with_context(|| format!("Failed to analyze folder: {}", options.folder.display()))?;
+            let app = App::load(traces_folder)
+                .with_context(|| format!("Failed to analyze folder: {}", traces_folder.display()))?;
 
             // Run the TUI
             run_tui(app)?;
         }
-        ReportMode::Text | ReportMode::Json => {
+        ReportMode::Text | ReportMode::Json | ReportMode::Summary
+        | ReportMode::Logs | ReportMode::Spans | ReportMode::Transcript | ReportMode::Dump => {
             // Load and analyze the data
-            let analysis = analyze_call(&options.folder)
-                .with_context(|| format!("Failed to analyze folder: {}", options.folder.display()))?;
+            let analysis = analyze_call(traces_folder)
+                .with_context(|| format!("Failed to analyze folder: {}", traces_folder.display()))?;
 
             // Generate report
-            let report = match options.report_mode {
+            let mut report = match options.report_mode {
                 ReportMode::Text => {
                     // Use no-color version if writing to file
                     if options.output_file.is_some() {
@@ -158,23 +215,44 @@ fn main() -> Result<()> {
                     }
                 }
                 ReportMode::Json => generate_json_report(&analysis),
+                ReportMode::Summary => report::generate_summary_report(&analysis),
+                ReportMode::Logs => report::generate_logs_report(&analysis),
+                ReportMode::Spans => report::generate_spans_report(&analysis),
+                ReportMode::Transcript => report::generate_transcript_report(&analysis),
+                ReportMode::Dump => report::generate_dump_report(&analysis),
                 _ => unreachable!(),
             };
 
-            // Output report
-            match options.output_file {
-                Some(ref path) => {
-                    fs::write(path, &report)
-                        .with_context(|| format!("Failed to write report to: {}", path.display()))?;
-                    eprintln!("Report written to: {}", path.display());
-                }
-                None => {
-                    println!("{}", report);
+            // If we also have a PCAP, append its analysis
+            if let Some(ref pcap_path) = prepared.pcap_file {
+                if let Ok(pcap_analysis) = pcap::parse_pcap(pcap_path) {
+                    report.push_str("\n\n");
+                    report.push_str(&"=".repeat(80));
+                    report.push_str("\n");
+                    report.push_str(&pcap::generate_pcap_report(&pcap_analysis));
                 }
             }
+
+            output_report(&report, &options.output_file)?;
         }
+        ReportMode::Pcap => unreachable!(), // Handled above
     }
 
+    Ok(())
+}
+
+/// Output a report to stdout or file.
+fn output_report(report: &str, output_file: &Option<PathBuf>) -> Result<()> {
+    match output_file {
+        Some(ref path) => {
+            fs::write(path, report)
+                .with_context(|| format!("Failed to write report to: {}", path.display()))?;
+            eprintln!("Report written to: {}", path.display());
+        }
+        None => {
+            println!("{}", report);
+        }
+    }
     Ok(())
 }
 

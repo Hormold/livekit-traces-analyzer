@@ -206,6 +206,40 @@ impl CallAnalysis {
             .filter(|t| t.interrupted)
             .collect()
     }
+
+    /// Extract latency values for E2E, LLM, and TTS from assistant turns.
+    /// Returns (e2e_values, llm_values, tts_values) in seconds.
+    pub fn extract_latency_values(&self) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        let assistant_turns = self.assistant_turns();
+
+        let e2e_values: Vec<f64> = assistant_turns
+            .iter()
+            .filter_map(|t| t.metrics.e2e_latency)
+            .collect();
+
+        let llm_values: Vec<f64> = assistant_turns
+            .iter()
+            .filter_map(|t| t.metrics.llm_node_ttft)
+            .collect();
+
+        let tts_values: Vec<f64> = assistant_turns
+            .iter()
+            .filter_map(|t| t.metrics.tts_node_ttfb)
+            .collect();
+
+        (e2e_values, llm_values, tts_values)
+    }
+
+    /// Compute latency statistics for E2E, LLM, and TTS.
+    /// Returns (e2e_stats, llm_stats, tts_stats).
+    pub fn compute_latency_stats(&self) -> (Option<LatencyStats>, Option<LatencyStats>, Option<LatencyStats>) {
+        let (e2e_values, llm_values, tts_values) = self.extract_latency_values();
+        (
+            LatencyStats::from_values(&e2e_values),
+            LatencyStats::from_values(&llm_values),
+            LatencyStats::from_values(&tts_values),
+        )
+    }
 }
 
 /// A single user→agent pipeline cycle with timing breakdown.
@@ -290,6 +324,12 @@ pub struct PipelineSummary {
 impl PipelineSummary {
     /// Generate pipeline summary from pipeline cycles.
     pub fn from_cycles(cycles: &[PipelineCycle]) -> Option<Self> {
+        use crate::thresholds::{
+            self, GAP_SIGNIFICANT_MS,
+            llm_severity, tts_severity, perception_severity, total_severity,
+            llm_verdict, tts_verdict, perception_verdict, total_verdict,
+        };
+
         if cycles.is_empty() {
             return None;
         }
@@ -310,55 +350,16 @@ impl PipelineSummary {
             0.0
         };
 
-        // Verdicts and severities
-        let (total_verdict, total_severity) = if avg_total_ms < 3000.0 {
-            ("good for voice", Severity::Good)
-        } else if avg_total_ms < 5000.0 {
-            ("acceptable", Severity::Good)
-        } else if avg_total_ms < 8000.0 {
-            ("slow, users will notice", Severity::Warning)
-        } else {
-            ("very slow, poor UX", Severity::Critical)
-        };
-
+        // Use centralized thresholds for verdicts and severities
         let llm_pct = if avg_total_ms > 0.0 { (avg_llm_ms / avg_total_ms) * 100.0 } else { 0.0 };
-        let (llm_verdict, llm_severity) = if avg_llm_ms < 1000.0 {
-            ("fast", Severity::Good)
-        } else if avg_llm_ms < 2000.0 {
-            ("normal", Severity::Good)
-        } else if avg_llm_ms < 4000.0 {
-            ("slow - consider faster model or shorter prompts", Severity::Warning)
-        } else {
-            ("very slow - check LLM provider or reduce context", Severity::Critical)
-        };
-
         let tts_pct = if avg_total_ms > 0.0 { (avg_tts_ms / avg_total_ms) * 100.0 } else { 0.0 };
-        let (tts_verdict, tts_severity) = if avg_tts_ms < 1500.0 {
-            ("fast", Severity::Good)
-        } else if avg_tts_ms < 3000.0 {
-            ("normal", Severity::Good)
-        } else if avg_tts_ms < 5000.0 {
-            ("slow - check TTS provider or voice settings", Severity::Warning)
-        } else {
-            ("very slow - TTS is major bottleneck", Severity::Critical)
-        };
-
-        let (perception_verdict, perception_severity) = if avg_user_to_llm_ms < 100.0 {
-            ("instant", Severity::Good)
-        } else if avg_user_to_llm_ms < 200.0 {
-            ("good VAD", Severity::Good)
-        } else if avg_user_to_llm_ms < 500.0 {
-            ("noticeable delay after user stops", Severity::Warning)
-        } else {
-            ("slow EOL detection - check VAD settings", Severity::Critical)
-        };
 
         // Bottleneck identification
-        let (bottleneck, bottleneck_severity) = if tts_pct > 50.0 {
+        let (bottleneck, bottleneck_sev) = if tts_pct > 50.0 {
             (format!("TTS is the main delay ({:.0}%)", tts_pct), Severity::Critical)
         } else if llm_pct > 50.0 {
             (format!("LLM is the main delay ({:.0}%)", llm_pct), Severity::Critical)
-        } else if avg_user_to_llm_ms > 300.0 {
+        } else if avg_user_to_llm_ms > thresholds::PERCEPTION_WARN_MS * 1.5 {
             ("Perception delay (VAD/EOL)".to_string(), Severity::Warning)
         } else {
             ("None dominant - balanced pipeline".to_string(), Severity::Good)
@@ -366,7 +367,7 @@ impl PipelineSummary {
 
         // Detected delays
         let detected_delays: Vec<DetectedDelay> = cycles.iter()
-            .filter(|c| c.gap_ms > 500.0 && c.gap_reason.is_some())
+            .filter(|c| c.gap_ms > GAP_SIGNIFICANT_MS && c.gap_reason.is_some())
             .map(|c| DetectedDelay {
                 turn_number: c.turn_number,
                 gap_ms: c.gap_ms,
@@ -378,23 +379,23 @@ impl PipelineSummary {
         Some(Self {
             avg_total_ms,
             max_total_ms,
-            total_verdict,
-            total_severity,
+            total_verdict: total_verdict(avg_total_ms),
+            total_severity: total_severity(avg_total_ms),
             avg_llm_ms,
             llm_pct,
-            llm_verdict,
-            llm_severity,
+            llm_verdict: llm_verdict(avg_llm_ms),
+            llm_severity: llm_severity(avg_llm_ms),
             avg_tts_ms,
             tts_pct,
-            tts_verdict,
-            tts_severity,
+            tts_verdict: tts_verdict(avg_tts_ms),
+            tts_severity: tts_severity(avg_tts_ms),
             avg_user_to_llm_ms,
             user_turn_count: user_count,
-            perception_verdict,
-            perception_severity,
+            perception_verdict: perception_verdict(avg_user_to_llm_ms),
+            perception_severity: perception_severity(avg_user_to_llm_ms),
             system_turn_count: count - user_count,
             bottleneck,
-            bottleneck_severity,
+            bottleneck_severity: bottleneck_sev,
             detected_delays,
         })
     }

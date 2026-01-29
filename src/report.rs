@@ -8,6 +8,14 @@ use std::io::IsTerminal;
 use serde::Serialize;
 
 use crate::data::{CallAnalysis, DiagnosisVerdict, LatencyStats, PipelineSummary, Severity};
+use crate::format::{format_duration, format_ms, word_wrap, truncate};
+use crate::thresholds::{
+    self, CAUSE_ICONS,
+    MAX_SLOW_TURNS_PER_CAUSE, MAX_WARNINGS_DISPLAY, MAX_TOOL_CALLS_DISPLAY,
+    MAX_SPANS_DISPLAY, MAX_DETECTED_DELAYS,
+    TEXT_PREVIEW_MEDIUM, TEXT_PREVIEW_LONG,
+    cause_label,
+};
 
 // =============================================================================
 // ANSI COLOR SUPPORT
@@ -41,39 +49,11 @@ fn colors(codes: &[&str]) -> String {
     codes.join("")
 }
 
-// =============================================================================
-// FORMATTING HELPERS
-// =============================================================================
-
-/// Format duration as mm:ss.ms.
-fn format_duration(seconds: f64) -> String {
-    let mins = (seconds / 60.0).floor() as i64;
-    let secs = seconds % 60.0;
-    format!("{}:{:05.2}", mins, secs)
-}
-
-/// Format milliseconds value.
-fn format_ms(value: Option<f64>) -> String {
-    match value {
-        Some(v) => format!("{:.0}ms", v * 1000.0),
-        None => "-".to_string(),
-    }
-}
-
-/// Get color based on latency value.
+/// Get ANSI color based on latency value (seconds).
 fn latency_color(ms: Option<f64>) -> &'static str {
     match ms {
         None => Colors::DIM,
-        Some(v) => {
-            let ms_val = v * 1000.0;
-            if ms_val < 500.0 {
-                Colors::GREEN
-            } else if ms_val < 1500.0 {
-                Colors::YELLOW
-            } else {
-                Colors::RED
-            }
-        }
+        Some(v) => severity_to_ansi(thresholds::e2e_severity(v * 1000.0)),
     }
 }
 
@@ -149,7 +129,7 @@ fn generate_pipeline_analysis_text(summary: &PipelineSummary, use_color: bool) -
         lines.push(String::new());
         lines.push(c("  Detected delays:", Colors::YELLOW));
 
-        for delay in summary.detected_delays.iter().take(5) {
+        for delay in summary.detected_delays.iter().take(MAX_DETECTED_DELAYS) {
             lines.push(format!(
                 "    Turn {}: +{:.1}s gap -> {}",
                 delay.turn_number,
@@ -158,39 +138,12 @@ fn generate_pipeline_analysis_text(summary: &PipelineSummary, use_color: bool) -
             ));
         }
 
-        if summary.detected_delays.len() > 5 {
+        if summary.detected_delays.len() > MAX_DETECTED_DELAYS {
             lines.push(c(
-                &format!("    ... and {} more turns with gaps", summary.detected_delays.len() - 5),
+                &format!("    ... and {} more turns with gaps", summary.detected_delays.len() - MAX_DETECTED_DELAYS),
                 Colors::DIM,
             ));
         }
-    }
-
-    lines
-}
-
-/// Word wrap text to a given width with prefix.
-fn word_wrap(text: &str, max_width: usize, prefix: &str) -> Vec<String> {
-    let mut lines = Vec::new();
-    let words: Vec<&str> = text.split_whitespace().collect();
-    let mut current_line = prefix.to_string();
-
-    for word in words {
-        if current_line.len() + word.len() + 1 > max_width {
-            if current_line.trim() != prefix.trim() {
-                lines.push(current_line);
-            }
-            current_line = format!("{}{}", prefix, word);
-        } else {
-            if current_line.len() > prefix.len() {
-                current_line.push(' ');
-            }
-            current_line.push_str(word);
-        }
-    }
-
-    if current_line.trim().len() > prefix.trim().len() {
-        lines.push(current_line);
     }
 
     lines
@@ -211,30 +164,314 @@ pub fn generate_text_report_no_color(analysis: &CallAnalysis) -> String {
     generate_text_report_impl(analysis, false)
 }
 
+/// Generate a logs dump (all logs in simple format).
+pub fn generate_logs_report(analysis: &CallAnalysis) -> String {
+    let mut lines: Vec<String> = Vec::new();
+
+    lines.push(format!("# LOGS ({} total, {} errors, {} warnings)",
+        analysis.logs.len(), analysis.errors.len(), analysis.warnings.len()));
+    lines.push(String::new());
+
+    for log in &analysis.logs {
+        let rel_time = log.timestamp_sec() - analysis.session_start;
+        let severity = match log.severity.as_str() {
+            "ERROR" | "CRITICAL" => "[ERROR]",
+            "WARN" | "WARNING" => "[WARN] ",
+            "INFO" => "[INFO] ",
+            "DEBUG" => "[DEBUG]",
+            _ => "[?????]",
+        };
+
+        lines.push(format!("{:>8.2}s {} {} | {}",
+            rel_time,
+            severity,
+            truncate(&log.logger_name, 30),
+            log.message.replace('\n', " | ")
+        ));
+    }
+
+    lines.join("\n")
+}
+
+/// Generate a spans dump (all spans with timing).
+pub fn generate_spans_report(analysis: &CallAnalysis) -> String {
+    let mut lines: Vec<String> = Vec::new();
+
+    lines.push(format!("# SPANS ({} total)", analysis.spans.len()));
+    lines.push(String::new());
+    lines.push(format!("{:>8}  {:>8}  {:30}  {}", "START", "DUR(ms)", "NAME", "TRACE_ID"));
+    lines.push(format!("{}", "-".repeat(80)));
+
+    for span in &analysis.spans {
+        let rel_start = span.start_sec() - analysis.session_start;
+        let dur_ms = span.duration_ms();
+
+        // Mark key spans
+        let marker = if thresholds::is_key_span(&span.name) { "*" } else { " " };
+
+        lines.push(format!("{:>7.2}s  {:>7.0}ms  {:30}{} {}",
+            rel_start,
+            dur_ms,
+            truncate(&span.name, 30),
+            marker,
+            truncate(&span.span_id, 16)
+        ));
+    }
+
+    lines.push(String::new());
+    lines.push("(* = key span)".to_string());
+
+    lines.join("\n")
+}
+
+/// Generate transcript only (conversation).
+pub fn generate_transcript_report(analysis: &CallAnalysis) -> String {
+    let mut lines: Vec<String> = Vec::new();
+
+    lines.push(format!("# TRANSCRIPT ({} turns)", analysis.turns.len()));
+    lines.push(format!("# Duration: {}", format_duration(analysis.duration_sec())));
+    lines.push(String::new());
+
+    for (i, turn) in analysis.turns.iter().enumerate() {
+        let turn_num = i + 1;
+
+        if turn.turn_type == "agent_handoff" {
+            let new_agent = turn
+                .extra
+                .get("new_agent_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&turn.id);
+            lines.push(format!("[{}] -- HANDOFF to {} --", turn_num, new_agent));
+            continue;
+        }
+
+        let role = turn.role.as_deref().unwrap_or("?").to_uppercase();
+        let text = turn.text();
+
+        // Build metrics
+        let mut metrics = Vec::new();
+        if let Some(e2e) = turn.metrics.e2e_latency {
+            metrics.push(format!("e2e={:.0}ms", e2e * 1000.0));
+        }
+        if let Some(llm) = turn.metrics.llm_node_ttft {
+            metrics.push(format!("llm={:.0}ms", llm * 1000.0));
+        }
+        if let Some(tts) = turn.metrics.tts_node_ttfb {
+            metrics.push(format!("tts={:.0}ms", tts * 1000.0));
+        }
+        if turn.interrupted {
+            metrics.push("INTERRUPTED".to_string());
+        }
+
+        let metrics_str = if metrics.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", metrics.join(", "))
+        };
+
+        lines.push(format!("[{}] {}{}", turn_num, role, metrics_str));
+        // Word-wrap text
+        for line in word_wrap(&text, 76, "    ") {
+            lines.push(line);
+        }
+        lines.push(String::new());
+    }
+
+    lines.join("\n")
+}
+
+/// Generate full dump (everything in one output).
+pub fn generate_dump_report(analysis: &CallAnalysis) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    // Summary first
+    parts.push("=".repeat(80));
+    parts.push("SUMMARY".to_string());
+    parts.push("=".repeat(80));
+    parts.push(generate_summary_report(analysis));
+    parts.push(String::new());
+
+    // Transcript
+    parts.push("=".repeat(80));
+    parts.push(generate_transcript_report(analysis));
+    parts.push(String::new());
+
+    // Tool calls
+    if !analysis.tool_calls.is_empty() {
+        parts.push("=".repeat(80));
+        parts.push(format!("# TOOL CALLS ({} total)", analysis.tool_calls.len()));
+        parts.push(String::new());
+
+        for tool in &analysis.tool_calls {
+            let rel_time = tool.start - analysis.session_start;
+            parts.push(format!("{:>7.2}s  {:>6.0}ms  {}",
+                rel_time,
+                tool.duration_ms,
+                tool.name
+            ));
+        }
+        parts.push(String::new());
+    }
+
+    // Errors (always show)
+    parts.push("=".repeat(80));
+    parts.push(format!("# ERRORS ({} total)", analysis.errors.len()));
+    parts.push(String::new());
+
+    if analysis.errors.is_empty() {
+        parts.push("(no errors)".to_string());
+    } else {
+        for log in &analysis.errors {
+            let rel_time = log.timestamp_sec() - analysis.session_start;
+            parts.push(format!("{:>7.2}s  {} | {}",
+                rel_time,
+                log.logger_name,
+                log.message.replace('\n', " | ")
+            ));
+        }
+    }
+    parts.push(String::new());
+
+    // Warnings
+    if !analysis.warnings.is_empty() {
+        parts.push("=".repeat(80));
+        parts.push(format!("# WARNINGS ({} total)", analysis.warnings.len()));
+        parts.push(String::new());
+
+        for log in analysis.warnings.iter().take(20) {
+            let rel_time = log.timestamp_sec() - analysis.session_start;
+            parts.push(format!("{:>7.2}s  {} | {}",
+                rel_time,
+                log.logger_name,
+                truncate(&log.message.replace('\n', " | "), 100)
+            ));
+        }
+        if analysis.warnings.len() > 20 {
+            parts.push(format!("... and {} more warnings", analysis.warnings.len() - 20));
+        }
+        parts.push(String::new());
+    }
+
+    // Key spans only (not all spans - too verbose)
+    let key_spans: Vec<_> = analysis.spans.iter()
+        .filter(|s| thresholds::is_key_span(&s.name))
+        .collect();
+
+    if !key_spans.is_empty() {
+        parts.push("=".repeat(80));
+        parts.push(format!("# KEY SPANS ({} of {} total)", key_spans.len(), analysis.spans.len()));
+        parts.push(String::new());
+        parts.push(format!("{:>8}  {:>8}  {}", "START", "DUR(ms)", "NAME"));
+
+        for span in key_spans.iter().take(50) {
+            let rel_start = span.start_sec() - analysis.session_start;
+            parts.push(format!("{:>7.2}s  {:>7.0}ms  {}",
+                rel_start,
+                span.duration_ms(),
+                span.name
+            ));
+        }
+        if key_spans.len() > 50 {
+            parts.push(format!("... and {} more spans", key_spans.len() - 50));
+        }
+    }
+
+    parts.join("\n")
+}
+
+/// Generate a brief summary report (for agents/scripts).
+/// Format: key=value pairs, one per line, easy to parse.
+pub fn generate_summary_report(analysis: &CallAnalysis) -> String {
+    let mut lines: Vec<String> = Vec::new();
+
+    // Compute stats
+    let (e2e_stats, llm_stats, tts_stats) = analysis.compute_latency_stats();
+    let summary = PipelineSummary::from_cycles(&analysis.pipeline_cycles);
+    let diagnosis = analysis.diagnosis.as_ref();
+
+    // Verdict
+    let verdict = match diagnosis.map(|d| &d.verdict) {
+        Some(DiagnosisVerdict::Healthy) => "HEALTHY",
+        Some(DiagnosisVerdict::Problematic) => "PROBLEMATIC",
+        Some(DiagnosisVerdict::NeedsAttention) => "NEEDS_ATTENTION",
+        None => "UNKNOWN",
+    };
+    lines.push(format!("verdict={}", verdict));
+
+    // Quick counts
+    let slow_turns: usize = diagnosis
+        .map(|d| d.slow_turns_by_cause.values().map(|v| v.len()).sum())
+        .unwrap_or(0);
+    lines.push(format!("slow_turns={}", slow_turns));
+    lines.push(format!("errors={}", analysis.errors.len()));
+    lines.push(format!("warnings={}", analysis.warnings.len()));
+
+    // Call info
+    lines.push(format!("duration_sec={:.1}", analysis.duration_sec()));
+    lines.push(format!("total_turns={}", analysis.turns.len()));
+    lines.push(format!("user_turns={}", analysis.user_turns().len()));
+    lines.push(format!("assistant_turns={}", analysis.assistant_turns().len()));
+    lines.push(format!("interrupted={}", analysis.interrupted_turns().len()));
+    lines.push(format!("tool_calls={}", analysis.tool_calls.len()));
+
+    // Latency stats (in ms)
+    if let Some(ref stats) = e2e_stats {
+        lines.push(format!("e2e_avg_ms={:.0}", stats.avg_ms));
+        lines.push(format!("e2e_p95_ms={:.0}", stats.p95_ms));
+        lines.push(format!("e2e_max_ms={:.0}", stats.max_ms));
+    }
+    if let Some(ref stats) = llm_stats {
+        lines.push(format!("llm_avg_ms={:.0}", stats.avg_ms));
+        lines.push(format!("llm_p95_ms={:.0}", stats.p95_ms));
+    }
+    if let Some(ref stats) = tts_stats {
+        lines.push(format!("tts_avg_ms={:.0}", stats.avg_ms));
+        lines.push(format!("tts_p95_ms={:.0}", stats.p95_ms));
+    }
+
+    // Pipeline breakdown
+    if let Some(ref s) = summary {
+        lines.push(format!("bottleneck={}", s.bottleneck.replace(' ', "_")));
+        lines.push(format!("llm_pct={:.0}", s.llm_pct));
+        lines.push(format!("tts_pct={:.0}", s.tts_pct));
+        lines.push(format!("perception_ms={:.0}", s.avg_user_to_llm_ms));
+    }
+
+    // Primary issue
+    if let Some(diag) = diagnosis {
+        if let Some(ref issue) = diag.primary_issue {
+            lines.push(format!("primary_issue={}", issue.replace(' ', "_")));
+        }
+        if diag.tts_retries > 0 {
+            lines.push(format!("tts_retries={}", diag.tts_retries));
+        }
+        if diag.tool_errors > 0 {
+            lines.push(format!("tool_errors={}", diag.tool_errors));
+        }
+    }
+
+    // Slow turn causes
+    if let Some(diag) = diagnosis {
+        for (cause, turns) in &diag.slow_turns_by_cause {
+            if !turns.is_empty() {
+                lines.push(format!("slow_{}_turns={}", cause.to_lowercase(), turns.len()));
+            }
+        }
+    }
+
+    // Room info
+    lines.push(format!("room_id={}", analysis.room_id));
+    lines.push(format!("agent={}", analysis.agent_name));
+
+    lines.join("\n")
+}
+
 fn generate_text_report_impl(analysis: &CallAnalysis, use_color: bool) -> String {
     let mut lines: Vec<String> = Vec::new();
     let c = |text: &str, color: &str| colorize(text, color, use_color);
 
-    // Compute latency stats
-    let e2e_values: Vec<f64> = analysis
-        .assistant_turns()
-        .iter()
-        .filter_map(|t| t.metrics.e2e_latency)
-        .collect();
-    let llm_values: Vec<f64> = analysis
-        .assistant_turns()
-        .iter()
-        .filter_map(|t| t.metrics.llm_node_ttft)
-        .collect();
-    let tts_values: Vec<f64> = analysis
-        .assistant_turns()
-        .iter()
-        .filter_map(|t| t.metrics.tts_node_ttfb)
-        .collect();
-
-    let e2e_stats = LatencyStats::from_values(&e2e_values);
-    let llm_stats = LatencyStats::from_values(&llm_values);
-    let tts_stats = LatencyStats::from_values(&tts_values);
+    // Compute latency stats using centralized method
+    let (e2e_stats, llm_stats, tts_stats) = analysis.compute_latency_stats();
 
     // Pre-calculate issues for header verdict
     let diagnosis = analysis.diagnosis.as_ref();
@@ -353,34 +590,26 @@ fn generate_text_report_impl(analysis: &CallAnalysis, use_color: bool) -> String
             ));
             lines.push(String::new());
 
-            // Show breakdown by cause
-            let cause_icons = [
-                ("LLM", "[LLM]"),
-                ("TTS", "[TTS]"),
-                ("STT", "[STT]"),
-                ("TOOL", "[TOOL]"),
-                ("OVERHEAD", "[GAP]"),
-            ];
-
-            for (cause, icon) in cause_icons {
-                if let Some(turns) = diag.slow_turns_by_cause.get(cause) {
+            // Show breakdown by cause (using centralized constants)
+            for (cause, icon) in CAUSE_ICONS {
+                if let Some(turns) = diag.slow_turns_by_cause.get(*cause) {
                     if turns.is_empty() {
                         continue;
                     }
 
-                    let color = if cause == "LLM" || cause == "TTS" || cause == "TOOL" {
+                    let color = if *cause == "LLM" || *cause == "TTS" || *cause == "TOOL" {
                         Colors::RED
                     } else {
                         Colors::YELLOW
                     };
 
                     lines.push(c(
-                        &format!("  {} {} BOTTLENECK: {} turns", icon, cause, turns.len()),
+                        &format!("  {} {} BOTTLENECK: {} turns", icon, cause_label(cause), turns.len()),
                         &colors(&[color, Colors::BOLD]),
                     ));
 
-                    for t in turns.iter().take(3) {
-                        let cause_ms = match cause {
+                    for t in turns.iter().take(MAX_SLOW_TURNS_PER_CAUSE) {
+                        let cause_ms = match *cause {
                             "LLM" => t.llm_ms,
                             "TTS" => t.tts_ms,
                             _ => t.unexplained_ms,
@@ -397,12 +626,12 @@ fn generate_text_report_impl(analysis: &CallAnalysis, use_color: bool) -> String
                             ),
                             color,
                         ));
-                        lines.push(format!("      \"{}...\"", t.text));
+                        lines.push(format!("      \"{}...\"", truncate(&t.text, TEXT_PREVIEW_MEDIUM)));
                     }
 
-                    if turns.len() > 3 {
+                    if turns.len() > MAX_SLOW_TURNS_PER_CAUSE {
                         lines.push(c(
-                            &format!("    ... and {} more {}-slow turns", turns.len() - 3, cause),
+                            &format!("    ... and {} more {}-slow turns", turns.len() - MAX_SLOW_TURNS_PER_CAUSE, cause),
                             Colors::DIM,
                         ));
                     }
@@ -664,8 +893,7 @@ fn generate_text_report_impl(analysis: &CallAnalysis, use_color: bool) -> String
                 &format!("  [{}] {}", format_duration(rel_time), log.logger_name),
                 Colors::RED,
             ));
-            let msg: String = log.message.chars().take(200).collect();
-            lines.push(format!("    {}", msg));
+            lines.push(format!("    {}", truncate(&log.message, TEXT_PREVIEW_LONG)));
         }
         lines.push(String::new());
     }
@@ -674,18 +902,17 @@ fn generate_text_report_impl(analysis: &CallAnalysis, use_color: bool) -> String
     if !analysis.warnings.is_empty() {
         lines.push(c("WARNINGS", &colors(&[Colors::BOLD, Colors::YELLOW])));
         lines.push(c(&"-".repeat(80), Colors::DIM));
-        for log in analysis.warnings.iter().take(10) {
+        for log in analysis.warnings.iter().take(MAX_WARNINGS_DISPLAY) {
             let rel_time = log.timestamp_sec() - analysis.session_start;
             lines.push(c(
                 &format!("  [{}] {}", format_duration(rel_time), log.logger_name),
                 Colors::YELLOW,
             ));
-            let msg: String = log.message.chars().take(200).collect();
-            lines.push(format!("    {}", msg));
+            lines.push(format!("    {}", truncate(&log.message, TEXT_PREVIEW_LONG)));
         }
-        if analysis.warnings.len() > 10 {
+        if analysis.warnings.len() > MAX_WARNINGS_DISPLAY {
             lines.push(c(
-                &format!("  ... and {} more warnings", analysis.warnings.len() - 10),
+                &format!("  ... and {} more warnings", analysis.warnings.len() - MAX_WARNINGS_DISPLAY),
                 Colors::DIM,
             ));
         }
@@ -721,7 +948,7 @@ fn generate_text_report_impl(analysis: &CallAnalysis, use_color: bool) -> String
 
         // Show timeline
         lines.push(c("  Timeline:", Colors::DIM));
-        for tool in analysis.tool_calls.iter().take(15) {
+        for tool in analysis.tool_calls.iter().take(MAX_TOOL_CALLS_DISPLAY) {
             let rel_time = tool.start - analysis.session_start;
             let dur_str = if tool.duration_ms > 0.0 {
                 format!("({:.0}ms)", tool.duration_ms)
@@ -735,9 +962,9 @@ fn generate_text_report_impl(analysis: &CallAnalysis, use_color: bool) -> String
                 dur_str
             ));
         }
-        if analysis.tool_calls.len() > 15 {
+        if analysis.tool_calls.len() > MAX_TOOL_CALLS_DISPLAY {
             lines.push(c(
-                &format!("    ... and {} more", analysis.tool_calls.len() - 15),
+                &format!("    ... and {} more", analysis.tool_calls.len() - MAX_TOOL_CALLS_DISPLAY),
                 Colors::DIM,
             ));
         }
@@ -746,14 +973,15 @@ fn generate_text_report_impl(analysis: &CallAnalysis, use_color: bool) -> String
 
     // High Latency Turns
     let assistant_turns = analysis.assistant_turns();
+    let high_latency_threshold = thresholds::E2E_SLOW_MS / 1000.0 * 1.5; // 3s
     let high_latency_turns: Vec<_> = assistant_turns
         .iter()
-        .filter(|t| t.metrics.e2e_latency.map(|e| e > 3.0).unwrap_or(false))
+        .filter(|t| t.metrics.e2e_latency.map(|e| e > high_latency_threshold).unwrap_or(false))
         .collect();
 
     if !high_latency_turns.is_empty() {
         lines.push(c(
-            "HIGH LATENCY TURNS (>3s E2E)",
+            &format!("HIGH LATENCY TURNS (>{:.0}s E2E)", high_latency_threshold),
             &colors(&[Colors::BOLD, Colors::RED]),
         ));
         lines.push(c(&"-".repeat(80), Colors::DIM));
@@ -768,29 +996,16 @@ fn generate_text_report_impl(analysis: &CallAnalysis, use_color: bool) -> String
                 Colors::RED,
             ));
             let text = turn.text();
-            let preview: String = text.chars().take(100).collect();
-            if text.len() > 100 {
-                lines.push(format!("    \"{}...\"", preview));
-            } else {
-                lines.push(format!("    \"{}\"", preview));
-            }
+            lines.push(format!("    \"{}\"", truncate(&text, TEXT_PREVIEW_MEDIUM)));
         }
         lines.push(String::new());
     }
 
-    // Key Spans Timeline
-    const KEY_SPAN_NAMES: &[&str] = &[
-        "agent_turn",
-        "user_turn",
-        "llm_node",
-        "tts_request",
-        "stt_request",
-        "function_call",
-    ];
+    // Key Spans Timeline (using centralized KEY_SPAN_NAMES)
     let key_spans: Vec<_> = analysis
         .spans
         .iter()
-        .filter(|s| KEY_SPAN_NAMES.contains(&s.name.as_str()))
+        .filter(|s| thresholds::is_key_span(&s.name))
         .collect();
 
     if !key_spans.is_empty() {
@@ -799,7 +1014,7 @@ fn generate_text_report_impl(analysis: &CallAnalysis, use_color: bool) -> String
             &colors(&[Colors::BOLD, Colors::BLUE]),
         ));
         lines.push(c(&"-".repeat(80), Colors::DIM));
-        for span in key_spans.iter().take(30) {
+        for span in key_spans.iter().take(MAX_SPANS_DISPLAY) {
             let rel_start = span.start_sec() - analysis.session_start;
             lines.push(format!(
                 "  [{}] {:20} ({:.0}ms)",
@@ -808,9 +1023,9 @@ fn generate_text_report_impl(analysis: &CallAnalysis, use_color: bool) -> String
                 span.duration_ms()
             ));
         }
-        if key_spans.len() > 30 {
+        if key_spans.len() > MAX_SPANS_DISPLAY {
             lines.push(c(
-                &format!("  ... and {} more spans", key_spans.len() - 30),
+                &format!("  ... and {} more spans", key_spans.len() - MAX_SPANS_DISPLAY),
                 Colors::DIM,
             ));
         }
@@ -978,26 +1193,8 @@ pub fn generate_json_report(analysis: &CallAnalysis) -> String {
 
 /// Build the JSON report structure.
 fn build_json_report(analysis: &CallAnalysis) -> JsonReport {
-    // Compute latency stats
-    let e2e_values: Vec<f64> = analysis
-        .assistant_turns()
-        .iter()
-        .filter_map(|t| t.metrics.e2e_latency)
-        .collect();
-    let llm_values: Vec<f64> = analysis
-        .assistant_turns()
-        .iter()
-        .filter_map(|t| t.metrics.llm_node_ttft)
-        .collect();
-    let tts_values: Vec<f64> = analysis
-        .assistant_turns()
-        .iter()
-        .filter_map(|t| t.metrics.tts_node_ttfb)
-        .collect();
-
-    let e2e_stats = LatencyStats::from_values(&e2e_values);
-    let llm_stats = LatencyStats::from_values(&llm_values);
-    let tts_stats = LatencyStats::from_values(&tts_values);
+    // Compute latency stats using centralized method
+    let (e2e_stats, llm_stats, tts_stats) = analysis.compute_latency_stats();
 
     // Build turns
     let turns: Vec<JsonTurn> = analysis
@@ -1021,16 +1218,16 @@ fn build_json_report(analysis: &CallAnalysis) -> JsonReport {
         .collect();
 
     // Build high latency turns
+    let high_latency_threshold = thresholds::E2E_SLOW_MS / 1000.0 * 1.5; // 3s
     let high_latency_turns: Vec<JsonHighLatencyTurn> = analysis
         .assistant_turns()
         .iter()
         .enumerate()
-        .filter(|(_, t)| t.metrics.e2e_latency.map(|e| e > 3.0).unwrap_or(false))
+        .filter(|(_, t)| t.metrics.e2e_latency.map(|e| e > high_latency_threshold).unwrap_or(false))
         .map(|(i, t)| {
-            let text: String = t.text().chars().take(100).collect();
             JsonHighLatencyTurn {
                 index: i + 1,
-                text,
+                text: truncate(&t.text(), TEXT_PREVIEW_MEDIUM),
                 e2e_latency_ms: t.metrics.e2e_latency.unwrap_or(0.0) * 1000.0,
                 llm_ttft_ms: t.metrics.llm_node_ttft.map(|v| v * 1000.0),
                 tts_ttfb_ms: t.metrics.tts_node_ttfb.map(|v| v * 1000.0),

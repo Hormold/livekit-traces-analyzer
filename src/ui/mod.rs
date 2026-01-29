@@ -20,6 +20,20 @@ use ratatui::{
 };
 
 use crate::app::{App, View};
+use crate::data::Severity;
+use crate::thresholds;
+
+// Re-export formatting functions from centralized module
+pub use crate::format::{format_duration, truncate};
+
+/// Convert Severity to ratatui Color.
+pub fn severity_to_color(severity: Severity) -> Color {
+    match severity {
+        Severity::Good => Color::Green,
+        Severity::Warning => Color::Yellow,
+        Severity::Critical => Color::Red,
+    }
+}
 
 /// Render the entire UI.
 pub fn render(frame: &mut Frame, app: &App) {
@@ -113,31 +127,7 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
-/// Color for latency values.
+/// Color for E2E latency values (in milliseconds).
 pub fn latency_color(ms: f64) -> Color {
-    if ms < 500.0 {
-        Color::Green
-    } else if ms < 1500.0 {
-        Color::Yellow
-    } else {
-        Color::Red
-    }
-}
-
-/// Format duration as mm:ss.ms.
-pub fn format_duration(seconds: f64) -> String {
-    let mins = (seconds / 60.0) as u32;
-    let secs = seconds % 60.0;
-    format!("{}:{:05.2}", mins, secs)
-}
-
-/// Truncate text to max length with ellipsis (UTF-8 safe).
-pub fn truncate(s: &str, max_len: usize) -> String {
-    let char_count = s.chars().count();
-    if char_count <= max_len {
-        s.to_string()
-    } else {
-        let truncated: String = s.chars().take(max_len.saturating_sub(3)).collect();
-        format!("{}...", truncated)
-    }
+    severity_to_color(thresholds::e2e_severity(ms))
 }
