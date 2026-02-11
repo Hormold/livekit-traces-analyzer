@@ -245,6 +245,42 @@ pub fn generate_transcript_report(analysis: &CallAnalysis) -> String {
             continue;
         }
 
+        if turn.turn_type == "function_call" {
+            let fn_name = turn.extra.get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let args_summary = turn.extra.get("arguments")
+                .map(|v| {
+                    let s = if let Some(s) = v.as_str() { s.to_string() } else { v.to_string() };
+                    summarize_tool_args_text(&s)
+                })
+                .unwrap_or_default();
+            if args_summary.is_empty() {
+                lines.push(format!("[{}] TOOL: {}()", turn_num, fn_name));
+            } else {
+                lines.push(format!("[{}] TOOL: {}({})", turn_num, fn_name, args_summary));
+            }
+            continue;
+        }
+
+        if turn.turn_type == "function_call_output" {
+            let fn_name = turn.extra.get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("tool");
+            let output = turn.extra.get("output")
+                .and_then(|v| v.as_str())
+                .unwrap_or("ok");
+            let output_display = if output.is_empty() || output == "ok" || output == "\"ok\"" {
+                "ok".to_string()
+            } else if output.len() > 60 {
+                format!("{}...", &output[..57])
+            } else {
+                output.to_string()
+            };
+            lines.push(format!("[{}]   {} -> {}", turn_num, fn_name, output_display));
+            continue;
+        }
+
         let role = turn.role.as_deref().unwrap_or("?").to_uppercase();
         let text = turn.text();
 
@@ -1294,4 +1330,36 @@ fn build_json_report(analysis: &CallAnalysis) -> JsonReport {
         high_latency_turns,
         errors,
     }
+}
+
+fn summarize_tool_args_text(args_str: &str) -> String {
+    let parsed: Result<serde_json::Value, _> = serde_json::from_str(args_str);
+    let obj = match parsed {
+        Ok(serde_json::Value::Object(map)) => map,
+        _ => return String::new(),
+    };
+
+    let mut parts: Vec<String> = Vec::new();
+    let mut total_len = 0usize;
+    for (k, v) in &obj {
+        let val_str = match v {
+            serde_json::Value::String(s) => {
+                if s.len() > 40 {
+                    format!("\"{}...\"", &s[..37])
+                } else {
+                    format!("\"{}\"", s)
+                }
+            }
+            serde_json::Value::Null => continue,
+            other => other.to_string(),
+        };
+        let part = format!("{}={}", k, val_str);
+        total_len += part.len() + 2;
+        if total_len > 80 {
+            parts.push("...".to_string());
+            break;
+        }
+        parts.push(part);
+    }
+    parts.join(", ")
 }

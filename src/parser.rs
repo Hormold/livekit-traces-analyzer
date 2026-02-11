@@ -43,13 +43,20 @@ fn parse_conversation_turn(item: &Value) -> Option<ConversationTurn> {
 
     let metrics = parse_turn_metrics(item);
 
-    let extra = match item.get("extra") {
+    let mut extra = match item.get("extra") {
         Some(Value::Object(obj)) => obj
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
         _ => HashMap::new(),
     };
+
+    // Capture top-level fields used by function_call / function_call_output items
+    for key in &["name", "arguments", "call_id", "output"] {
+        if let Some(val) = item.get(*key) {
+            extra.entry(key.to_string()).or_insert_with(|| val.clone());
+        }
+    }
 
     Some(ConversationTurn {
         id,

@@ -40,6 +40,60 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
             continue;
         }
 
+        // Handle function_call: show tool name and summarized arguments
+        if turn.turn_type == "function_call" {
+            let fn_name = turn.extra
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+
+            let args_summary = turn.extra
+                .get("arguments")
+                .map(|v| summarize_tool_args(v))
+                .unwrap_or_default();
+
+            lines.push(Line::from(vec![
+                Span::styled(format!("  [{}] ", i + 1), Style::default().fg(Color::DarkGray)),
+                Span::styled("[T] ", Style::default().fg(Color::Yellow)),
+                Span::styled("TOOL: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(fn_name.to_string(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("({})", args_summary), Style::default().fg(Color::DarkGray)),
+            ]));
+            lines.push(Line::from(""));
+            continue;
+        }
+
+        // Handle function_call_output: show compactly
+        if turn.turn_type == "function_call_output" {
+            let fn_name = turn.extra
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+
+            let output = turn.extra
+                .get("output")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            // Show compact output -- truncate if long
+            let display_output = if output.is_empty() || output == "ok" || output == "\"ok\"" {
+                "ok".to_string()
+            } else if output.len() > 60 {
+                format!("{}...", &output[..57])
+            } else {
+                output.to_string()
+            };
+
+            lines.push(Line::from(vec![
+                Span::styled(format!("  [{}] ", i + 1), Style::default().fg(Color::DarkGray)),
+                Span::styled("[T] ", Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{} -> ", fn_name), Style::default().fg(Color::DarkGray)),
+                Span::styled(display_output, Style::default().fg(Color::DarkGray)),
+            ]));
+            lines.push(Line::from(""));
+            continue;
+        }
+
         let (role_icon, role_color) = match turn.role.as_deref() {
             Some("user") => ("[U]", Color::Green),
             Some("assistant") => ("[A]", Color::Cyan),
@@ -158,4 +212,77 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
 
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, area);
+}
+
+/// Summarize tool call arguments into a compact string.
+///
+/// The arguments value can be either a JSON string (e.g. `"{ \"q\": \"q1\", ... }"`)
+/// or a JSON object. We extract key-value pairs and produce a short summary like:
+/// `q1, "answer text..."` -- truncating long values.
+fn summarize_tool_args(value: &serde_json::Value) -> String {
+    use serde_json::Value;
+
+    // Parse the arguments -- could be a JSON string or already an object
+    let obj = match value {
+        Value::String(s) => {
+            match serde_json::from_str::<Value>(s) {
+                Ok(Value::Object(map)) => map,
+                _ => return truncate_str(s, 80),
+            }
+        }
+        Value::Object(map) => map.clone(),
+        _ => return value.to_string(),
+    };
+
+    if obj.is_empty() {
+        return String::new();
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    let mut total_len = 0;
+    let max_total = 80;
+
+    for (key, val) in &obj {
+        if total_len > max_total {
+            parts.push("...".to_string());
+            break;
+        }
+
+        let val_str = match val {
+            Value::String(s) => {
+                // Show short strings directly, truncate long ones
+                if s.len() > 40 {
+                    format!("\"{}...\"", &s[..37])
+                } else {
+                    format!("\"{}\"", s)
+                }
+            }
+            Value::Bool(b) => b.to_string(),
+            Value::Number(n) => n.to_string(),
+            Value::Null => "null".to_string(),
+            _ => {
+                let s = val.to_string();
+                if s.len() > 30 {
+                    format!("{}...", &s[..27])
+                } else {
+                    s
+                }
+            }
+        };
+
+        let part = format!("{}={}", key, val_str);
+        total_len += part.len() + 2;
+        parts.push(part);
+    }
+
+    parts.join(", ")
+}
+
+/// Truncate a string to a maximum length, adding "..." if truncated.
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max_len.saturating_sub(3)])
+    }
 }
