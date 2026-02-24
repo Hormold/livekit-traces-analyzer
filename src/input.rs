@@ -123,32 +123,24 @@ pub fn extract_zip(zip_path: &Path) -> Result<(PathBuf, tempfile::TempDir)> {
         temp_dir.path().to_path_buf()
     };
 
-    // Check if it looks like observability data
-    let logs_path = extract_path.join("logs.json");
-    let spans_path = extract_path.join("spans.json");
-
-    if logs_path.exists() || spans_path.exists() {
+    // Check if it looks like observability data.
+    // Files may be named exactly logs.json/spans.json or prefixed like
+    // p_xxx_RM_yyy_logs.json / p_xxx_RM_yyy_traces.json.
+    if has_observability_files(&extract_path) {
         Ok((extract_path, temp_dir))
+    } else if has_observability_files(temp_dir.path()) {
+        Ok((temp_dir.path().to_path_buf(), temp_dir))
     } else {
-        // Maybe files are directly in temp_dir
-        let logs_direct = temp_dir.path().join("logs.json");
-        let spans_direct = temp_dir.path().join("spans.json");
+        let contents: Vec<_> = fs::read_dir(temp_dir.path())?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path().display().to_string())
+            .take(10)
+            .collect();
 
-        if logs_direct.exists() || spans_direct.exists() {
-            Ok((temp_dir.path().to_path_buf(), temp_dir))
-        } else {
-            // List what we found
-            let contents: Vec<_> = fs::read_dir(temp_dir.path())?
-                .filter_map(|e| e.ok())
-                .map(|e| e.path().display().to_string())
-                .take(10)
-                .collect();
-
-            bail!(
-                "ZIP extracted but no logs.json/spans.json found. Contents: {:?}",
-                contents
-            );
-        }
+        bail!(
+            "ZIP extracted but no observability JSON files found. Contents: {:?}",
+            contents
+        );
     }
 }
 
@@ -194,4 +186,19 @@ pub fn prepare_input(paths: &[PathBuf]) -> Result<PreparedInput> {
         pcap_file,
         _temp_dir: temp_dir,
     })
+}
+
+/// Check if a directory contains observability JSON files.
+/// Matches both exact names (logs.json, spans.json, traces.json) and
+/// prefixed variants (e.g. p_xxx_RM_yyy_logs.json).
+fn has_observability_files(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else { return false };
+    entries
+        .filter_map(|e| e.ok())
+        .any(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            name.ends_with(".json")
+                && (name.contains("logs") || name.contains("traces") || name.contains("spans")
+                    || name.contains("chat_history"))
+        })
 }

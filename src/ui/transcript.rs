@@ -174,6 +174,49 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
             lines.push(Line::from(metrics_spans));
         }
 
+        // Show E2E breakdown if available
+        if let Some(ref bd) = turn.breakdown {
+            if bd.has_tool_call || bd.overhead_ms.map(|v| v > 500.0).unwrap_or(false) {
+                let mut bd_spans: Vec<Span> = vec![Span::raw("      ")];
+                bd_spans.push(Span::styled("breakdown: ", Style::default().fg(Color::DarkGray)));
+
+                let mut parts: Vec<Span> = Vec::new();
+                if let Some(stt) = bd.stt_ms {
+                    parts.push(Span::styled(format!("stt={:.0}ms", stt), Style::default().fg(Color::Gray)));
+                }
+                if let Some(eol) = bd.eol_ms {
+                    parts.push(Span::styled(format!("eol={:.0}ms", eol), Style::default().fg(
+                        if eol > 1000.0 { Color::Red } else if eol > 500.0 { Color::Yellow } else { Color::Gray }
+                    )));
+                }
+                if let Some(fl) = bd.first_llm_ms {
+                    parts.push(Span::styled(format!("llm1={:.0}ms", fl), Style::default().fg(latency_color(fl))));
+                }
+                if let Some(tool) = bd.tool_ms {
+                    let tool_color = if tool > 500.0 { Color::Red } else if tool > 100.0 { Color::Yellow } else { Color::Gray };
+                    parts.push(Span::styled(format!("tool={:.0}ms", tool), Style::default().fg(tool_color)));
+                }
+                if let Some(llm) = bd.llm_ms {
+                    parts.push(Span::styled(format!("llm2={:.0}ms", llm), Style::default().fg(latency_color(llm))));
+                }
+                if let Some(tts) = bd.tts_ms {
+                    parts.push(Span::styled(format!("tts={:.0}ms", tts), Style::default().fg(latency_color(tts))));
+                }
+                if let Some(oh) = bd.overhead_ms {
+                    parts.push(Span::styled(format!("other={:.0}ms", oh), Style::default().fg(Color::Yellow)));
+                }
+
+                for (idx, part) in parts.into_iter().enumerate() {
+                    if idx > 0 {
+                        bd_spans.push(Span::styled(" -> ", Style::default().fg(Color::DarkGray)));
+                    }
+                    bd_spans.push(part);
+                }
+
+                lines.push(Line::from(bd_spans));
+            }
+        }
+
         // Content
         let text = turn.text();
         if !text.is_empty() {

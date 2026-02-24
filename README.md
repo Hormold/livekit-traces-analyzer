@@ -1,6 +1,6 @@
 # LiveKit Traces Analyzer
 
-Interactive TUI for analyzing LiveKit voice agent call observability data. Helps diagnose latency issues, understand pipeline timing, and debug voice agent performance.
+Interactive TUI and CLI for analyzing LiveKit voice agent call observability data. Optimized for AI agents to quickly find where the problem is -- provides detailed E2E latency breakdowns showing exactly where time is spent (STT, VAD/EOL detection, LLM tool-decision calls, tool execution, LLM response generation, TTS).
 
 ## Installation
 
@@ -55,15 +55,17 @@ Export traces from your LiveKit agent using the observability API or download fr
 
 ## Features
 
+- **E2E Breakdown**: Per-turn latency waterfall showing STT -> EOL -> LLM1 (tool decision) -> Tool exec -> LLM2 (response) -> TTS
 - **Overview**: Pipeline timing breakdown, bottleneck identification
-- **Transcript**: Full conversation with timestamps
-- **Latency**: Per-turn E2E, LLM, TTS latency analysis
+- **Transcript**: Full conversation with per-turn metrics and inline breakdowns
+- **Latency**: Per-turn E2E, LLM, TTS latency analysis with slow turn diagnosis
 - **Charts**: Visual latency distribution (ASCII)
 - **Agents**: Agent session and state transitions
 - **Tools**: Function/tool call history and durations
 - **Context**: LLM prompts and responses
 - **Logs**: Errors and warnings
 - **Spans**: OpenTelemetry span timeline
+- **PCAP**: SIP signaling and RTP quality analysis
 
 ## Keyboard Shortcuts
 

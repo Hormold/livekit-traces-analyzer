@@ -306,6 +306,31 @@ pub fn generate_transcript_report(analysis: &CallAnalysis) -> String {
         };
 
         lines.push(format!("[{}] {}{}", turn_num, role, metrics_str));
+
+        // Show E2E breakdown if available
+        if let Some(ref bd) = turn.breakdown {
+            if bd.has_tool_call || bd.overhead_ms.map(|v| v > 500.0).unwrap_or(false) {
+                let mut parts = Vec::new();
+                if let Some(stt) = bd.stt_ms { parts.push(format!("stt={:.0}ms", stt)); }
+                if let Some(eol) = bd.eol_ms { parts.push(format!("eol={:.0}ms", eol)); }
+                if let Some(first) = bd.first_llm_ms { parts.push(format!("llm1={:.0}ms", first)); }
+                if let Some(tool) = bd.tool_ms {
+                    let names = if bd.tool_names.is_empty() {
+                        String::new()
+                    } else {
+                        format!("[{}]", bd.tool_names.join(","))
+                    };
+                    parts.push(format!("tool={:.0}ms{}", tool, names));
+                }
+                if let Some(llm) = bd.llm_ms { parts.push(format!("llm2={:.0}ms", llm)); }
+                if let Some(tts) = bd.tts_ms { parts.push(format!("tts={:.0}ms", tts)); }
+                if let Some(oh) = bd.overhead_ms { parts.push(format!("other={:.0}ms", oh)); }
+                if !parts.is_empty() {
+                    lines.push(format!("    [{}]", parts.join(" -> ")));
+                }
+            }
+        }
+
         // Word-wrap text
         for line in word_wrap(&text, 76, "    ") {
             lines.push(line);
@@ -347,6 +372,58 @@ pub fn generate_dump_report(analysis: &CallAnalysis) -> String {
             ));
         }
         parts.push(String::new());
+    }
+
+    // E2E Breakdowns for turns with tool calls or significant overhead
+    let turns_with_breakdown: Vec<(usize, &crate::data::ConversationTurn)> = analysis.turns.iter()
+        .enumerate()
+        .filter(|(_, t)| t.breakdown.as_ref()
+            .map(|b| b.has_tool_call || b.overhead_ms.map(|v| v > 500.0).unwrap_or(false))
+            .unwrap_or(false))
+        .collect();
+
+    if !turns_with_breakdown.is_empty() {
+        parts.push("=".repeat(80));
+        parts.push(format!("# E2E BREAKDOWNS ({} turns with tool calls or significant overhead)",
+            turns_with_breakdown.len()));
+        parts.push(String::new());
+
+        for (i, turn) in &turns_with_breakdown {
+            let bd = turn.breakdown.as_ref().unwrap();
+            let e2e = turn.metrics.e2e_latency.map(|v| v * 1000.0).unwrap_or(0.0);
+            let text_preview: String = turn.text().chars().take(60).collect();
+
+            parts.push(format!("  Turn {} (e2e={:.0}ms): \"{}...\"", i + 1, e2e, text_preview));
+
+            if let Some(stt) = bd.stt_ms { parts.push(format!("    STT:        {:>6.0}ms  (transcription)", stt)); }
+            if let Some(eol) = bd.eol_ms { parts.push(format!("    EOL:        {:>6.0}ms  (end-of-turn detection)", eol)); }
+            if let Some(fl) = bd.first_llm_ms { parts.push(format!("    LLM (1st):  {:>6.0}ms  (tool decision)", fl)); }
+            if let Some(tool) = bd.tool_ms {
+                let names = bd.tool_names.join(", ");
+                parts.push(format!("    Tool exec:  {:>6.0}ms  ({})", tool, if names.is_empty() { "tool call" } else { &names }));
+            }
+            if let Some(llm) = bd.llm_ms { parts.push(format!("    LLM (2nd):  {:>6.0}ms  (response generation)", llm)); }
+            if let Some(tts) = bd.tts_ms { parts.push(format!("    TTS:        {:>6.0}ms  (speech synthesis)", tts)); }
+            if let Some(oh) = bd.overhead_ms { parts.push(format!("    Overhead:   {:>6.0}ms  (processing/network)", oh)); }
+
+            // Percentage bar
+            if e2e > 0.0 {
+                let pcts: Vec<String> = [
+                    ("STT", bd.stt_ms),
+                    ("EOL", bd.eol_ms),
+                    ("LLM1", bd.first_llm_ms),
+                    ("TOOL", bd.tool_ms),
+                    ("LLM2", bd.llm_ms),
+                    ("TTS", bd.tts_ms),
+                    ("OTHER", bd.overhead_ms),
+                ].iter()
+                    .filter_map(|(name, val)| val.map(|v| format!("{}:{:.0}%", name, v / e2e * 100.0)))
+                    .collect();
+                parts.push(format!("    [{}]", pcts.join(" | ")));
+            }
+
+            parts.push(String::new());
+        }
     }
 
     // Errors (always show)
@@ -492,6 +569,50 @@ pub fn generate_summary_report(analysis: &CallAnalysis) -> String {
             if !turns.is_empty() {
                 lines.push(format!("slow_{}_turns={}", cause.to_lowercase(), turns.len()));
             }
+        }
+    }
+
+    // User-side delay averages
+    let user_turns_with_delays: Vec<_> = analysis.turns.iter()
+        .filter(|t| t.role.as_deref() == Some("user") && t.metrics.transcription_delay.is_some())
+        .collect();
+
+    if !user_turns_with_delays.is_empty() {
+        let count = user_turns_with_delays.len() as f64;
+        let avg_stt: f64 = user_turns_with_delays.iter()
+            .filter_map(|t| t.metrics.transcription_delay)
+            .map(|v| v * 1000.0)
+            .sum::<f64>() / count;
+        let avg_eol: f64 = user_turns_with_delays.iter()
+            .filter_map(|t| t.metrics.end_of_turn_delay)
+            .map(|v| v * 1000.0)
+            .sum::<f64>() / count;
+        lines.push(format!("stt_avg_ms={:.0}", avg_stt));
+        lines.push(format!("eol_avg_ms={:.0}", avg_eol));
+    }
+
+    // Tool-call turn breakdown stats
+    let tool_call_turns: Vec<_> = analysis.turns.iter()
+        .filter(|t| t.breakdown.as_ref().map(|b| b.has_tool_call).unwrap_or(false))
+        .collect();
+
+    if !tool_call_turns.is_empty() {
+        lines.push(format!("tool_call_turns={}", tool_call_turns.len()));
+
+        let first_llm_vals: Vec<f64> = tool_call_turns.iter()
+            .filter_map(|t| t.breakdown.as_ref().and_then(|b| b.first_llm_ms))
+            .collect();
+        if !first_llm_vals.is_empty() {
+            let avg: f64 = first_llm_vals.iter().sum::<f64>() / first_llm_vals.len() as f64;
+            lines.push(format!("first_llm_avg_ms={:.0}", avg));
+        }
+
+        let tool_exec_vals: Vec<f64> = tool_call_turns.iter()
+            .filter_map(|t| t.breakdown.as_ref().and_then(|b| b.tool_ms))
+            .collect();
+        if !tool_exec_vals.is_empty() {
+            let avg: f64 = tool_exec_vals.iter().sum::<f64>() / tool_exec_vals.len() as f64;
+            lines.push(format!("tool_exec_avg_ms={:.0}", avg));
         }
     }
 
@@ -662,6 +783,24 @@ fn generate_text_report_impl(analysis: &CallAnalysis, use_color: bool) -> String
                             ),
                             color,
                         ));
+
+                        // Show inline breakdown for TOOL/OVERHEAD causes
+                        if *cause == "TOOL" || *cause == "OVERHEAD" {
+                            let mut bd_parts = Vec::new();
+                            if let Some(stt) = t.stt_ms { bd_parts.push(format!("stt={:.0}ms", stt)); }
+                            if let Some(eol) = t.eol_ms { bd_parts.push(format!("eol={:.0}ms", eol)); }
+                            if let Some(fl) = t.first_llm_ms { bd_parts.push(format!("llm1={:.0}ms", fl)); }
+                            if let Some(te) = t.tool_exec_ms { bd_parts.push(format!("tool={:.0}ms", te)); }
+                            bd_parts.push(format!("llm2={:.0}ms", t.llm_ms));
+                            bd_parts.push(format!("tts={:.0}ms", t.tts_ms));
+                            if !bd_parts.is_empty() {
+                                lines.push(c(
+                                    &format!("      Breakdown: {}", bd_parts.join(" + ")),
+                                    Colors::DIM,
+                                ));
+                            }
+                        }
+
                         lines.push(format!("      \"{}...\"", truncate(&t.text, TEXT_PREVIEW_MEDIUM)));
                     }
 
@@ -1159,6 +1298,20 @@ pub struct JsonLatency {
     pub tts_ttfb: JsonLatencyStats,
 }
 
+/// JSON report structure for a turn's E2E breakdown.
+#[derive(Debug, Serialize)]
+pub struct JsonTurnBreakdown {
+    pub stt_ms: Option<f64>,
+    pub eol_ms: Option<f64>,
+    pub first_llm_ms: Option<f64>,
+    pub tool_ms: Option<f64>,
+    pub tool_names: Vec<String>,
+    pub llm_ms: Option<f64>,
+    pub tts_ms: Option<f64>,
+    pub overhead_ms: Option<f64>,
+    pub has_tool_call: bool,
+}
+
 /// JSON report structure for turn metrics.
 #[derive(Debug, Serialize)]
 pub struct JsonTurnMetrics {
@@ -1167,6 +1320,8 @@ pub struct JsonTurnMetrics {
     pub tts_ttfb_ms: Option<f64>,
     pub speaking_duration_sec: Option<f64>,
     pub transcript_confidence: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub breakdown: Option<JsonTurnBreakdown>,
 }
 
 /// JSON report structure for a turn.
@@ -1249,6 +1404,17 @@ fn build_json_report(analysis: &CallAnalysis) -> JsonReport {
                 tts_ttfb_ms: t.metrics.tts_node_ttfb.map(|v| v * 1000.0),
                 speaking_duration_sec: t.metrics.speaking_duration(),
                 transcript_confidence: t.metrics.transcript_confidence,
+                breakdown: t.breakdown.as_ref().map(|b| JsonTurnBreakdown {
+                    stt_ms: b.stt_ms,
+                    eol_ms: b.eol_ms,
+                    first_llm_ms: b.first_llm_ms,
+                    tool_ms: b.tool_ms,
+                    tool_names: b.tool_names.clone(),
+                    llm_ms: b.llm_ms,
+                    tts_ms: b.tts_ms,
+                    overhead_ms: b.overhead_ms,
+                    has_tool_call: b.has_tool_call,
+                }),
             },
         })
         .collect();

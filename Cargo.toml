@@ -1,6 +1,6 @@
 [package]
 name = "livekit-analyzer"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Interactive TUI for analyzing LiveKit call observability data"
 authors = ["Hormold"]

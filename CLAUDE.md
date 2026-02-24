@@ -616,3 +616,17 @@ Recommendations:
 | Logs | `--logs` | Error investigation |
 | Spans | `--spans` | Timing deep-dive |
 | PCAP | `--pcap` | Network-only analysis |
+
+## Release Workflow
+
+To release a new version:
+
+1. **Bump version** in `Cargo.toml` (field `version`)
+2. **Verify build**: `cargo build --release`
+3. **Stage changed files**: `git add <files>` (include `Cargo.toml`)
+4. **Commit**: `git commit -m "feat: <description>"`
+5. **Tag**: `git tag -a vX.Y.Z -m "vX.Y.Z - <short description>"`
+6. **Push with tag**: `git push origin main --tags`
+7. **Create GitHub release**: `gh release create vX.Y.Z --generate-notes`
+
+Version follows semver: bump **patch** for fixes, **minor** for features, **major** for breaking changes.

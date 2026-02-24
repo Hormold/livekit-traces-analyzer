@@ -12,6 +12,9 @@ pub struct TurnMetrics {
     pub tts_node_ttfb: Option<f64>,      // TTS time to first byte (seconds)
     pub e2e_latency: Option<f64>,        // End-to-end latency (seconds)
     pub transcript_confidence: Option<f64>,
+    // User-side delays (only present on user turns)
+    pub transcription_delay: Option<f64>,  // STT processing time (seconds)
+    pub end_of_turn_delay: Option<f64>,    // VAD/EOL detection time (seconds)
 }
 
 impl TurnMetrics {
@@ -21,6 +24,30 @@ impl TurnMetrics {
             _ => None,
         }
     }
+}
+
+/// Detailed E2E breakdown for an assistant turn, computed post-parse.
+/// All values in milliseconds.
+#[derive(Debug, Clone, Default)]
+pub struct TurnBreakdown {
+    /// STT transcription delay from the preceding user turn
+    pub stt_ms: Option<f64>,
+    /// VAD/EOL detection delay from the preceding user turn
+    pub eol_ms: Option<f64>,
+    /// Duration of the first LLM call (tool-decision), if a tool call occurred
+    pub first_llm_ms: Option<f64>,
+    /// Tool execution duration
+    pub tool_ms: Option<f64>,
+    /// Name(s) of tools called in this turn
+    pub tool_names: Vec<String>,
+    /// The reported llm_node_ttft (2nd LLM or only LLM)
+    pub llm_ms: Option<f64>,
+    /// The reported tts_node_ttfb
+    pub tts_ms: Option<f64>,
+    /// Remaining unexplained overhead
+    pub overhead_ms: Option<f64>,
+    /// Whether this turn involved tool calls
+    pub has_tool_call: bool,
 }
 
 /// A single turn in the conversation.
@@ -34,6 +61,7 @@ pub struct ConversationTurn {
     pub created_at: f64,
     pub metrics: TurnMetrics,
     pub extra: HashMap<String, serde_json::Value>,
+    pub breakdown: Option<TurnBreakdown>,
 }
 
 impl ConversationTurn {
@@ -130,6 +158,11 @@ pub struct SlowTurnInfo {
     pub unexplained_ms: f64,
     pub text: String,
     pub tool_name: Option<String>,
+    // Detailed breakdown fields
+    pub first_llm_ms: Option<f64>,
+    pub tool_exec_ms: Option<f64>,
+    pub stt_ms: Option<f64>,
+    pub eol_ms: Option<f64>,
 }
 
 /// Complete analysis of a call.

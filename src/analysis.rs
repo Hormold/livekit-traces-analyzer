@@ -7,7 +7,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use regex::Regex;
 
-use crate::data::{CallAnalysis, CallDiagnosis, DiagnosisVerdict, PipelineCycle, SlowTurnInfo, Span, ToolCall};
+use crate::data::{CallAnalysis, CallDiagnosis, ConversationTurn, DiagnosisVerdict, PipelineCycle, SlowTurnInfo, Span, ToolCall, TurnBreakdown};
 use crate::parser::{
     extract_system_prompt, load_json_file, parse_chat_history, parse_llm_turns_from_traces,
     parse_logs, parse_traces,
@@ -138,6 +138,9 @@ pub fn analyze_call(folder: &Path) -> Result<CallAnalysis> {
 
     // Compute pipeline cycles (pass tool_calls for gap analysis)
     analysis.pipeline_cycles = compute_pipeline_cycles(&analysis.spans, &analysis.tool_calls);
+
+    // Compute per-turn E2E breakdowns (must be after turns + spans are loaded)
+    compute_turn_breakdowns(&mut analysis);
 
     // Compute diagnosis
     analysis.diagnosis = Some(compute_diagnosis(&analysis));
@@ -323,6 +326,204 @@ pub fn compute_pipeline_cycles(spans: &[Span], tool_calls: &[ToolCall]) -> Vec<P
     cycles
 }
 
+/// Compute per-turn E2E breakdowns to explain where latency comes from.
+///
+/// For each assistant turn with e2e_latency, this finds the preceding user turn's
+/// delays (STT, EOL), detects tool calls between them, and when possible identifies
+/// the "first LLM call" (tool-decision) that isn't captured in llm_node_ttft.
+fn compute_turn_breakdowns(analysis: &mut CallAnalysis) {
+    // Build lookup: agent_turn spans sorted by start time
+    let agent_turn_spans: Vec<usize> = analysis.spans.iter()
+        .enumerate()
+        .filter(|(_, s)| s.name == "agent_turn")
+        .map(|(i, _)| i)
+        .collect();
+
+    for i in 0..analysis.turns.len() {
+        if analysis.turns[i].role.as_deref() != Some("assistant") {
+            continue;
+        }
+
+        let e2e = match analysis.turns[i].metrics.e2e_latency {
+            Some(e) => e * 1000.0,
+            None => continue,
+        };
+
+        // Find preceding user turn
+        let preceding_user = (0..i).rev()
+            .find(|&j| analysis.turns[j].role.as_deref() == Some("user"));
+
+        let (stt_ms, eol_ms) = if let Some(ui) = preceding_user {
+            (
+                analysis.turns[ui].metrics.transcription_delay.map(|v| v * 1000.0),
+                analysis.turns[ui].metrics.end_of_turn_delay.map(|v| v * 1000.0),
+            )
+        } else {
+            (None, None)
+        };
+
+        // Check for function_call items between user turn and this assistant turn
+        let range_start = preceding_user.map(|ui| ui + 1).unwrap_or(0);
+        let fn_call_indices: Vec<usize> = (range_start..i)
+            .filter(|&j| analysis.turns[j].turn_type == "function_call")
+            .collect();
+
+        let has_tool_call = !fn_call_indices.is_empty();
+
+        // Extract tool names
+        let tool_names: Vec<String> = fn_call_indices.iter()
+            .filter_map(|&j| analysis.turns[j].extra.get("name")
+                .and_then(|v| v.as_str())
+                .map(String::from))
+            .collect();
+
+        // Try to find first_llm_ms from spans (multiple llm_node under one agent_turn)
+        let mut first_llm_ms = None;
+        let mut tool_ms_from_spans = None;
+
+        if has_tool_call {
+            let turn_created = analysis.turns[i].created_at;
+            let turn_started = analysis.turns[i].metrics.started_speaking_at.unwrap_or(turn_created);
+
+            // Find matching agent_turn span by overlap with this assistant turn's timing
+            let matching_at_idx = agent_turn_spans.iter().find(|&&si| {
+                let s = &analysis.spans[si];
+                s.start_sec() <= turn_started && turn_started <= s.end_sec() + 1.0
+            });
+
+            if let Some(&at_idx) = matching_at_idx {
+                let at_span_id = analysis.spans[at_idx].span_id.clone();
+
+                // Find all llm_node descendants of this agent_turn
+                let children = find_children(&analysis.spans, &at_span_id);
+                let mut llm_nodes: Vec<&Span> = Vec::new();
+
+                for child in &children {
+                    if child.name == "llm_node" {
+                        llm_nodes.push(child);
+                    }
+                    // Also check grandchildren
+                    let grandchildren = find_children(&analysis.spans, &child.span_id);
+                    for gc in grandchildren {
+                        if gc.name == "llm_node" {
+                            llm_nodes.push(gc);
+                        }
+                    }
+                }
+                llm_nodes.sort_by_key(|s| s.start_time_ns);
+
+                if llm_nodes.len() >= 2 {
+                    // First llm_node = tool-decision LLM call
+                    first_llm_ms = Some(llm_nodes[0].duration_ms());
+                }
+
+                // Find function_tool spans within this agent_turn's time range
+                let at_start = analysis.spans[at_idx].start_sec();
+                let at_end = analysis.spans[at_idx].end_sec();
+                let tool_span_dur: f64 = analysis.spans.iter()
+                    .filter(|s| s.name == "function_tool"
+                        && s.start_sec() >= at_start
+                        && s.end_sec() <= at_end
+                        && s.duration_ms() > 0.0)
+                    .map(|s| s.duration_ms())
+                    .sum();
+
+                if tool_span_dur > 0.0 {
+                    tool_ms_from_spans = Some(tool_span_dur);
+                }
+            }
+        }
+
+        // Fallback: estimate tool execution from chat_history timestamps
+        let tool_ms = tool_ms_from_spans.or_else(|| {
+            if !has_tool_call { return None; }
+            estimate_tool_duration_from_chat(&analysis.turns, &fn_call_indices, i)
+        });
+
+        // If no first_llm_ms from spans, estimate from timestamps
+        if first_llm_ms.is_none() && has_tool_call {
+            if let Some(ui) = preceding_user {
+                let user_stopped = analysis.turns[ui].metrics.stopped_speaking_at;
+                let eol_delay = analysis.turns[ui].metrics.end_of_turn_delay;
+                let first_fc_created = fn_call_indices.first()
+                    .map(|&j| analysis.turns[j].created_at);
+
+                if let (Some(stopped), Some(fc_created)) = (user_stopped, first_fc_created) {
+                    let eol = eol_delay.unwrap_or(0.0);
+                    let estimated = (fc_created - stopped - eol) * 1000.0;
+                    if estimated > 50.0 {
+                        first_llm_ms = Some(estimated);
+                    }
+                }
+            }
+        }
+
+        let llm_ms = analysis.turns[i].metrics.llm_node_ttft.map(|v| v * 1000.0);
+        let tts_ms = analysis.turns[i].metrics.tts_node_ttfb.map(|v| v * 1000.0);
+
+        // Compute overhead
+        let explained: f64 = [stt_ms, eol_ms, first_llm_ms, tool_ms, llm_ms, tts_ms]
+            .iter()
+            .filter_map(|v| *v)
+            .sum();
+        let overhead_ms = (e2e - explained).max(0.0);
+
+        // Only store breakdown if there's a tool call or significant unexplained time
+        let unexplained_without_breakdown = e2e - llm_ms.unwrap_or(0.0) - tts_ms.unwrap_or(0.0);
+        let should_store = has_tool_call || unexplained_without_breakdown > 500.0;
+
+        if should_store {
+            analysis.turns[i].breakdown = Some(TurnBreakdown {
+                stt_ms,
+                eol_ms,
+                first_llm_ms,
+                tool_ms,
+                tool_names,
+                llm_ms,
+                tts_ms,
+                overhead_ms: if overhead_ms > 50.0 { Some(overhead_ms) } else { None },
+                has_tool_call,
+            });
+        }
+    }
+}
+
+/// Estimate tool execution duration from chat_history timestamps.
+fn estimate_tool_duration_from_chat(
+    turns: &[ConversationTurn],
+    fn_call_indices: &[usize],
+    assistant_turn_idx: usize,
+) -> Option<f64> {
+    let mut total_ms = 0.0;
+    let mut found_any = false;
+
+    for &fc_idx in fn_call_indices {
+        let call_created = turns[fc_idx].created_at;
+        if call_created == 0.0 { continue; }
+
+        let call_id = turns[fc_idx].extra.get("call_id")
+            .and_then(|v| v.as_str());
+
+        // Find matching function_call_output
+        for j in (fc_idx + 1)..assistant_turn_idx {
+            if turns[j].turn_type == "function_call_output" {
+                let output_call_id = turns[j].extra.get("call_id")
+                    .and_then(|v| v.as_str());
+                if call_id == output_call_id || call_id.is_none() {
+                    let output_created = turns[j].created_at;
+                    if output_created > call_created {
+                        total_ms += (output_created - call_created) * 1000.0;
+                        found_any = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if found_any { Some(total_ms) } else { None }
+}
+
 /// Compute call diagnosis.
 fn compute_diagnosis(analysis: &CallAnalysis) -> CallDiagnosis {
     let mut slow_turns_by_cause: HashMap<String, Vec<SlowTurnInfo>> = HashMap::new();
@@ -394,6 +595,10 @@ fn compute_diagnosis(analysis: &CallAnalysis) -> CallDiagnosis {
             unexplained_ms,
             text: text_preview,
             tool_name,
+            first_llm_ms: turn.breakdown.as_ref().and_then(|b| b.first_llm_ms),
+            tool_exec_ms: turn.breakdown.as_ref().and_then(|b| b.tool_ms),
+            stt_ms: turn.breakdown.as_ref().and_then(|b| b.stt_ms),
+            eol_ms: turn.breakdown.as_ref().and_then(|b| b.eol_ms),
         };
 
         let cause_key = if primary_cause == "OTHER" {

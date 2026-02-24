@@ -67,6 +67,7 @@ fn parse_conversation_turn(item: &Value) -> Option<ConversationTurn> {
         created_at,
         metrics,
         extra,
+        breakdown: None,
     })
 }
 
@@ -80,6 +81,8 @@ fn parse_turn_metrics(item: &Value) -> TurnMetrics {
         tts_node_ttfb: metrics_data.get("tts_node_ttfb").and_then(|v| v.as_f64()),
         e2e_latency: metrics_data.get("e2e_latency").and_then(|v| v.as_f64()),
         transcript_confidence: item.get("transcript_confidence").and_then(|v| v.as_f64()),
+        transcription_delay: metrics_data.get("transcription_delay").and_then(|v| v.as_f64()),
+        end_of_turn_delay: metrics_data.get("end_of_turn_delay").and_then(|v| v.as_f64()),
     }
 }
 
