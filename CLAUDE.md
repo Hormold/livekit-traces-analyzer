@@ -325,6 +325,102 @@ For programmatic analysis, use `--format json`:
 }
 ```
 
+## LiveKit Cloud Integration (Experimental)
+
+Fetch sessions and download observability data directly from LiveKit Cloud.
+Credentials are read from `~/.livekit/cli-config.yaml` (shared with `lk` CLI).
+
+### Prerequisites
+
+1. Install the LiveKit CLI: `brew install livekit-cli` (or see [docs](https://docs.livekit.io/home/cli/cli-setup/))
+2. Authenticate: `lk cloud auth`
+3. For **download**: a browser session token (see below)
+
+### Commands
+
+```bash
+# List configured projects (* = default)
+livekit-analyzer cloud projects
+
+# List recent sessions
+livekit-analyzer cloud sessions
+livekit-analyzer cloud sessions --limit 10 --page 2
+livekit-analyzer cloud sessions --json
+
+# Show session details (participants, timing, region)
+livekit-analyzer cloud info RM_bMvTTdAVKvmW
+
+# Download observability data (logs, traces, audio, chat history)
+livekit-analyzer cloud download RM_bMvTTdAVKvmW
+livekit-analyzer cloud download RM_bMvTTdAVKvmW -o ./my-session
+livekit-analyzer cloud download RM_bMvTTdAVKvmW --token <SESSION_TOKEN>
+
+# Download + analyze in one pipeline
+livekit-analyzer cloud download RM_xxx -o ./session && livekit-analyzer ./session --dump
+```
+
+### Options
+
+| Flag | Description |
+|------|-------------|
+| `-p, --project <NAME>` | Project name (default: from config) |
+| `-t, --token <TOKEN>` | Session token for download |
+| `--limit <N>` | Max sessions to list (default: 20) |
+| `--page <N>` | Page number (default: 0) |
+| `--json` | JSON output for sessions list |
+| `-o, --output <DIR>` | Output directory for download |
+
+### Authentication
+
+Two auth mechanisms are used:
+
+| Command | Auth | Source |
+|---------|------|--------|
+| `projects`, `sessions`, `info` | JWT (automatic) | `~/.livekit/cli-config.yaml` |
+| `download` | Session token | Browser cookie / `--token` / `LK_CLOUD_TOKEN` env |
+
+**Getting the session token** (required for download):
+1. Log in to https://cloud.livekit.io
+2. Open DevTools (F12) → Application → Cookies → `cloud.livekit.io`
+3. Find `__Secure-authjs.browser-session-token`
+4. Copy the value
+
+The token is saved to `~/.livekit/session-token` after first use. If it expires,
+the tool automatically re-prompts. You can also set the `LK_CLOUD_TOKEN` env var.
+
+### Download Output
+
+The `download` command saves these files (renamed from ZIP for analyzer compatibility):
+
+| File | Description |
+|------|-------------|
+| `metadata.json` | Session info (participants, timing, bandwidth) |
+| `spans.json` | OpenTelemetry traces (renamed from `*_traces.json`) |
+| `logs.json` | Agent logs (renamed from `*_logs.json`) |
+| `audio.oga` | Session audio recording |
+| `chat_history.json` | Conversation transcript |
+
+### Agent Workflow (Autonomous)
+
+For AI agents to autonomously analyze a LiveKit session:
+
+```bash
+# Step 1: Find the session
+livekit-analyzer cloud sessions --json | jq '.[0].sessionId'
+
+# Step 2: Download it
+livekit-analyzer cloud download RM_xxx -o ./session-data
+
+# Step 3: Analyze
+livekit-analyzer ./session-data --summary
+
+# Step 4: Deep dive if needed
+livekit-analyzer ./session-data --dump
+```
+
+The `projects`, `sessions`, and `info` commands work fully automatically with
+just `lk cloud auth`. Only `download` requires the one-time browser token setup.
+
 ## Analysis Workflow for Agents
 
 ### Step 1: Get Quick Assessment

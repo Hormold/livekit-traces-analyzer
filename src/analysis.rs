@@ -7,7 +7,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use regex::Regex;
 
-use crate::data::{CallAnalysis, CallDiagnosis, ConversationTurn, DiagnosisVerdict, PipelineCycle, SlowTurnInfo, Span, ToolCall, TurnBreakdown};
+use crate::data::{CallAnalysis, CallDiagnosis, ConversationTurn, DiagnosisVerdict, PipelineCycle, SlowTurnInfo, Span, SpanDerivedMetrics, ToolCall, TurnBreakdown};
 use crate::parser::{
     extract_system_prompt, load_json_file, parse_chat_history, parse_llm_turns_from_traces,
     parse_logs, parse_traces,
@@ -58,6 +58,7 @@ pub fn analyze_call(folder: &Path) -> Result<CallAnalysis> {
         analysis.spans = parse_traces(&data);
         analysis.llm_turns = parse_llm_turns_from_traces(&data);
         analysis.system_prompt = extract_system_prompt(&data);
+        analysis.span_metrics = extract_span_metrics(&analysis.spans);
     }
 
     // Extract metadata from spans
@@ -715,4 +716,177 @@ fn determine_primary_issue(
     }
 
     (None, None)
+}
+
+fn get_attr_u64_opt(attrs: &HashMap<String, serde_json::Value>, key: &str) -> Option<u64> {
+    attrs.get(key)
+        .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i as u64)))
+}
+
+fn get_attr_f64(attrs: &HashMap<String, serde_json::Value>, key: &str) -> Option<f64> {
+    attrs.get(key).and_then(|v| v.as_f64())
+}
+
+/// Helper to extract a field from a parsed kvlist (JSON object) attribute.
+fn get_kvlist_f64(attrs: &HashMap<String, serde_json::Value>, kvlist_key: &str, field: &str) -> Option<f64> {
+    attrs.get(kvlist_key)
+        .and_then(|v| v.get(field))
+        .and_then(|v| v.as_f64())
+}
+
+fn get_kvlist_bool(attrs: &HashMap<String, serde_json::Value>, kvlist_key: &str, field: &str) -> bool {
+    attrs.get(kvlist_key)
+        .and_then(|v| v.get(field))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Extract detailed metrics from llm_request, tts_request, and eou_detection spans.
+///
+/// Attribute layout (after OTEL parsing):
+/// - llm_request: `gen_ai.request.model` (string), `gen_ai.usage.input_tokens` (int),
+///   `gen_ai.usage.output_tokens` (int), `lk.llm_metrics` (kvlist with prompt_tokens,
+///   completion_tokens, prompt_cached_tokens, tokens_per_second, cancelled)
+/// - tts_request: `lk.tts.label` (string), `lk.tts_metrics` (kvlist with audio_duration,
+///   cancelled, characters_count, metadata.model_name)
+/// - eou_detection: `lk.eou.probability`, `lk.eou.endpointing_delay`, `lk.eou.unlikely_threshold`
+fn extract_span_metrics(spans: &[Span]) -> SpanDerivedMetrics {
+    let mut metrics = SpanDerivedMetrics::default();
+
+    let mut tps_values: Vec<f64> = Vec::new();
+    let mut tts_rt_factors: Vec<f64> = Vec::new();
+    let mut eou_probs: Vec<f64> = Vec::new();
+    let mut eou_delays: Vec<f64> = Vec::new();
+
+    for span in spans {
+        match span.name.as_str() {
+            "llm_request" => {
+                metrics.llm_request_count += 1;
+
+                // Model from gen_ai.request.model
+                let model = get_attr_string(&span.attributes, "gen_ai.request.model");
+                if !model.is_empty() && metrics.llm_model.is_empty() {
+                    metrics.llm_model = model;
+                }
+
+                // Tokens from lk.llm_metrics kvlist (more detailed than gen_ai.usage.*)
+                let pt = get_kvlist_f64(&span.attributes, "lk.llm_metrics", "prompt_tokens")
+                    .map(|v| v as u64)
+                    .or_else(|| get_attr_u64_opt(&span.attributes, "gen_ai.usage.input_tokens"))
+                    .unwrap_or(0);
+                let ct = get_kvlist_f64(&span.attributes, "lk.llm_metrics", "completion_tokens")
+                    .map(|v| v as u64)
+                    .or_else(|| get_attr_u64_opt(&span.attributes, "gen_ai.usage.output_tokens"))
+                    .unwrap_or(0);
+                let cached = get_kvlist_f64(&span.attributes, "lk.llm_metrics", "prompt_cached_tokens")
+                    .map(|v| v as u64)
+                    .unwrap_or(0);
+
+                metrics.total_prompt_tokens += pt;
+                metrics.total_completion_tokens += ct;
+                metrics.total_cached_tokens += cached;
+
+                if let Some(tps) = get_kvlist_f64(&span.attributes, "lk.llm_metrics", "tokens_per_second") {
+                    if tps > 0.0 {
+                        tps_values.push(tps);
+                    }
+                }
+
+                if get_kvlist_bool(&span.attributes, "lk.llm_metrics", "cancelled") {
+                    metrics.cancelled_llm_count += 1;
+                }
+            }
+            "tts_request" => {
+                metrics.tts_request_count += 1;
+
+                // Provider from lk.tts_metrics.metadata.model_name + model_provider
+                if metrics.tts_provider.is_empty() {
+                    // Try metadata nested object first
+                    if let Some(tts_metrics) = span.attributes.get("lk.tts_metrics") {
+                        if let Some(metadata) = tts_metrics.get("metadata") {
+                            let model_name = metadata.get("model_name").and_then(|v| v.as_str()).unwrap_or("");
+                            let provider = metadata.get("model_provider").and_then(|v| v.as_str()).unwrap_or("");
+                            if !model_name.is_empty() {
+                                metrics.tts_provider = if !provider.is_empty() {
+                                    format!("{} {}", provider, model_name)
+                                } else {
+                                    model_name.to_string()
+                                };
+                            }
+                        }
+                    }
+                    // Fallback to lk.tts.label
+                    if metrics.tts_provider.is_empty() {
+                        let label = get_attr_string(&span.attributes, "lk.tts.label");
+                        if !label.is_empty() {
+                            // Extract short name from "livekit.plugins.elevenlabs.tts.TTS"
+                            let parts: Vec<&str> = label.split('.').collect();
+                            if parts.len() >= 3 {
+                                metrics.tts_provider = parts[2].to_string(); // "elevenlabs"
+                            } else {
+                                metrics.tts_provider = label;
+                            }
+                        }
+                    }
+                }
+
+                // Audio duration and realtime factor from lk.tts_metrics
+                if let Some(audio_dur) = get_kvlist_f64(&span.attributes, "lk.tts_metrics", "audio_duration") {
+                    if let Some(duration) = get_kvlist_f64(&span.attributes, "lk.tts_metrics", "duration") {
+                        if duration > 0.0 && audio_dur > 0.0 {
+                            tts_rt_factors.push(audio_dur / duration);
+                        }
+                    }
+                }
+
+                if get_kvlist_bool(&span.attributes, "lk.tts_metrics", "cancelled") {
+                    metrics.cancelled_tts_count += 1;
+                }
+            }
+            "eou_detection" => {
+                metrics.eou_count += 1;
+
+                if let Some(prob) = get_attr_f64(&span.attributes, "lk.eou.probability") {
+                    eou_probs.push(prob);
+                    if prob > 0.5 {
+                        metrics.eou_high_confidence_count += 1;
+                    } else if prob < 0.1 {
+                        metrics.eou_low_confidence_count += 1;
+                    }
+                }
+
+                if let Some(delay) = get_attr_f64(&span.attributes, "lk.eou.endpointing_delay") {
+                    eou_delays.push(delay);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Compute aggregates
+    if !tps_values.is_empty() {
+        metrics.avg_tokens_per_sec = tps_values.iter().sum::<f64>() / tps_values.len() as f64;
+        metrics.min_tokens_per_sec = tps_values.iter().cloned().fold(f64::INFINITY, f64::min);
+    }
+    if metrics.total_prompt_tokens > 0 {
+        metrics.cache_hit_pct = metrics.total_cached_tokens as f64 / metrics.total_prompt_tokens as f64 * 100.0;
+    }
+    if !tts_rt_factors.is_empty() {
+        metrics.avg_tts_realtime_factor = tts_rt_factors.iter().sum::<f64>() / tts_rt_factors.len() as f64;
+    }
+    if !eou_probs.is_empty() {
+        metrics.eou_avg_probability = eou_probs.iter().sum::<f64>() / eou_probs.len() as f64;
+    }
+    if !eou_delays.is_empty() {
+        // Most common delay value (mode)
+        let mut delay_counts: HashMap<String, usize> = HashMap::new();
+        for d in &eou_delays {
+            *delay_counts.entry(format!("{:.1}", d)).or_insert(0) += 1;
+        }
+        if let Some((most_common, _)) = delay_counts.iter().max_by_key(|(_, c)| *c) {
+            metrics.eou_endpointing_delay = most_common.parse().unwrap_or(0.0);
+        }
+    }
+
+    metrics
 }

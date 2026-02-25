@@ -131,6 +131,36 @@ pub struct ToolCall {
     pub duration_ms: f64,
 }
 
+/// Aggregated span-level metrics for the entire call.
+#[derive(Debug, Clone, Default)]
+pub struct SpanDerivedMetrics {
+    // Model info
+    pub llm_model: String,
+    pub tts_provider: String,
+
+    // LLM aggregates
+    pub llm_request_count: usize,
+    pub total_prompt_tokens: u64,
+    pub total_completion_tokens: u64,
+    pub total_cached_tokens: u64,
+    pub cache_hit_pct: f64,
+    pub avg_tokens_per_sec: f64,
+    pub min_tokens_per_sec: f64,
+    pub cancelled_llm_count: usize,
+
+    // TTS aggregates
+    pub tts_request_count: usize,
+    pub avg_tts_realtime_factor: f64,
+    pub cancelled_tts_count: usize,
+
+    // EOU aggregates
+    pub eou_count: usize,
+    pub eou_high_confidence_count: usize,
+    pub eou_low_confidence_count: usize,
+    pub eou_avg_probability: f64,
+    pub eou_endpointing_delay: f64,
+}
+
 /// Call diagnosis summary.
 #[derive(Debug, Clone)]
 pub struct CallDiagnosis {
@@ -192,6 +222,7 @@ pub struct CallAnalysis {
     pub tool_calls: Vec<ToolCall>,
     pub diagnosis: Option<CallDiagnosis>,
     pub pipeline_cycles: Vec<PipelineCycle>,
+    pub span_metrics: SpanDerivedMetrics,
 }
 
 impl CallAnalysis {
@@ -215,6 +246,7 @@ impl CallAnalysis {
             tool_calls: Vec::new(),
             diagnosis: None,
             pipeline_cycles: Vec::new(),
+            span_metrics: SpanDerivedMetrics::default(),
         }
     }
 
@@ -277,6 +309,7 @@ impl CallAnalysis {
 
 /// A single user→agent pipeline cycle with timing breakdown.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct PipelineCycle {
     pub turn_number: usize,
     pub has_user_turn: bool,      // Whether this was triggered by user speech

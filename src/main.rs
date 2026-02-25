@@ -2,6 +2,7 @@
 
 mod analysis;
 mod app;
+mod cloud;
 mod data;
 mod events;
 mod format;
@@ -77,6 +78,12 @@ fn print_usage(program: &str) {
     eprintln!("Other Options:");
     eprintln!("  -o, --output <file> Write report to file instead of stdout");
     eprintln!("  -h, --help          Show this help message");
+    eprintln!();
+    eprintln!("Cloud (experimental):");
+    eprintln!("  cloud projects      List LiveKit Cloud projects");
+    eprintln!("  cloud sessions      List recent sessions");
+    eprintln!("  cloud download <ID> Download session observability data");
+    eprintln!("  cloud --help        Full cloud help");
     eprintln!();
     eprintln!("Examples:");
     eprintln!("  {} ./observability-RM_xxx", program);
@@ -155,6 +162,26 @@ fn parse_args() -> Result<CliOptions, String> {
 }
 
 fn main() -> Result<()> {
+    // Check for `cloud` subcommand before normal parsing
+    let args: Vec<String> = env::args().collect();
+    if args.len() > 1 && args[1] == "cloud" {
+        let cloud_args = &args[2..];
+        let cloud_opts = match cloud::parse_cloud_args(cloud_args) {
+            Ok(opts) => opts,
+            Err(e) if e == "show_help" => {
+                cloud::print_cloud_help();
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                eprintln!();
+                cloud::print_cloud_help();
+                std::process::exit(1);
+            }
+        };
+        return cloud::run(cloud_opts);
+    }
+
     // Parse command line arguments
     let options = match parse_args() {
         Ok(opts) => opts,

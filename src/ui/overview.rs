@@ -20,7 +20,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(12), // Top row: Metadata + Pipeline side by side
+            Constraint::Length(14), // Top row: Metadata + Pipeline side by side
             Constraint::Min(0),      // Diagnosis details
         ])
         .split(area);
@@ -51,7 +51,7 @@ fn render_metadata(frame: &mut Frame, app: &App, area: Rect) {
         None => ("?", Color::Gray),
     };
 
-    let lines = vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::styled(format!(" {} ", verdict_text), Style::default().fg(verdict_color).add_modifier(Modifier::BOLD)),
             Span::styled("│ Duration: ", Style::default().fg(Color::DarkGray)),
@@ -91,6 +91,32 @@ fn render_metadata(frame: &mut Frame, app: &App, area: Rect) {
         ]),
     ];
 
+    // Model & Provider (from span metrics)
+    let sm = &a.span_metrics;
+    if !sm.llm_model.is_empty() || !sm.tts_provider.is_empty() {
+        let mut model_spans: Vec<Span> = vec![
+            Span::styled(" Model: ", Style::default().fg(Color::Gray)),
+        ];
+        if !sm.llm_model.is_empty() {
+            model_spans.push(Span::styled(sm.llm_model.clone(), Style::default().fg(Color::White)));
+        }
+        if !sm.tts_provider.is_empty() {
+            model_spans.push(Span::styled(" │ TTS: ", Style::default().fg(Color::Gray)));
+            model_spans.push(Span::styled(sm.tts_provider.clone(), Style::default().fg(Color::White)));
+        }
+        lines.push(Line::from(model_spans));
+    }
+    if sm.total_prompt_tokens > 0 {
+        lines.push(Line::from(vec![
+            Span::styled(" Tokens: ", Style::default().fg(Color::Gray)),
+            Span::raw(format!("{}K prompt", sm.total_prompt_tokens / 1000)),
+            Span::styled(format!(" ({:.0}% cached)", sm.cache_hit_pct),
+                Style::default().fg(if sm.cache_hit_pct > 80.0 { Color::Green } else { Color::Yellow })),
+            Span::styled(format!(" │ {:.0} tok/s", sm.avg_tokens_per_sec),
+                Style::default().fg(if sm.avg_tokens_per_sec > 20.0 { Color::Green } else if sm.avg_tokens_per_sec > 10.0 { Color::Yellow } else { Color::Red })),
+        ]));
+    }
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(verdict_color))
@@ -117,6 +143,25 @@ fn render_diagnosis(frame: &mut Frame, app: &App, area: Rect) {
     let cycles = &app.analysis.pipeline_cycles;
     if !cycles.is_empty() {
         lines.extend(generate_pipeline_summary(cycles));
+        lines.push(Line::from(""));
+    }
+
+    // EOU confidence stats
+    let sm = &app.analysis.span_metrics;
+    if sm.eou_count > 0 {
+        let eou_color = if (sm.eou_high_confidence_count as f64 / sm.eou_count as f64) > 0.5 {
+            Color::Green
+        } else if (sm.eou_high_confidence_count as f64 / sm.eou_count as f64) > 0.2 {
+            Color::Yellow
+        } else {
+            Color::Red
+        };
+        lines.push(Line::from(vec![
+            Span::styled("  EOU confidence: ", Style::default().fg(Color::Gray)),
+            Span::styled(format!("{}/{} high", sm.eou_high_confidence_count, sm.eou_count), Style::default().fg(eou_color)),
+            Span::styled(format!(" (avg={:.3}, delay={:.1}s)",
+                sm.eou_avg_probability, sm.eou_endpointing_delay), Style::default().fg(Color::DarkGray)),
+        ]));
         lines.push(Line::from(""));
     }
 

@@ -426,6 +426,63 @@ pub fn generate_dump_report(analysis: &CallAnalysis) -> String {
         }
     }
 
+    // Model & Provider Info
+    let sm = &analysis.span_metrics;
+    if sm.llm_request_count > 0 || sm.tts_request_count > 0 {
+        parts.push("=".repeat(80));
+        parts.push("# MODEL & PROVIDER INFO".to_string());
+        parts.push(String::new());
+
+        if !sm.llm_model.is_empty() {
+            parts.push(format!("  LLM Model:    {}", sm.llm_model));
+        }
+        if !sm.tts_provider.is_empty() {
+            parts.push(format!("  TTS Provider: {}", sm.tts_provider));
+        }
+        parts.push(String::new());
+
+        if sm.llm_request_count > 0 {
+            parts.push("  LLM Usage:".to_string());
+            parts.push(format!("    Requests:       {}", sm.llm_request_count));
+            parts.push(format!("    Prompt tokens:  {} ({} cached, {:.1}% hit rate)",
+                sm.total_prompt_tokens, sm.total_cached_tokens, sm.cache_hit_pct));
+            parts.push(format!("    Output tokens:  {}", sm.total_completion_tokens));
+            if sm.avg_tokens_per_sec > 0.0 {
+                parts.push(format!("    Speed:          {:.1} tok/s avg, {:.1} tok/s min",
+                    sm.avg_tokens_per_sec, sm.min_tokens_per_sec));
+            }
+            if sm.cancelled_llm_count > 0 {
+                parts.push(format!("    Cancelled:      {} requests", sm.cancelled_llm_count));
+            }
+            parts.push(String::new());
+        }
+
+        if sm.tts_request_count > 0 {
+            parts.push("  TTS Usage:".to_string());
+            parts.push(format!("    Requests:       {}", sm.tts_request_count));
+            if sm.avg_tts_realtime_factor > 0.0 {
+                parts.push(format!("    Realtime factor: {:.1}x (audio produced {:.1}x faster than realtime)",
+                    sm.avg_tts_realtime_factor, sm.avg_tts_realtime_factor));
+            }
+            if sm.cancelled_tts_count > 0 {
+                parts.push(format!("    Cancelled:      {} requests", sm.cancelled_tts_count));
+            }
+            parts.push(String::new());
+        }
+
+        if sm.eou_count > 0 {
+            parts.push("  EOU (End-of-Utterance) Detection:".to_string());
+            parts.push(format!("    Total detections:  {}", sm.eou_count));
+            parts.push(format!("    High confidence:   {} (>50%)", sm.eou_high_confidence_count));
+            parts.push(format!("    Low confidence:    {} (<10%)", sm.eou_low_confidence_count));
+            parts.push(format!("    Avg probability:   {:.3}", sm.eou_avg_probability));
+            if sm.eou_endpointing_delay > 0.0 {
+                parts.push(format!("    Endpointing delay: {:.1}s", sm.eou_endpointing_delay));
+            }
+            parts.push(String::new());
+        }
+    }
+
     // Errors (always show)
     parts.push("=".repeat(80));
     parts.push(format!("# ERRORS ({} total)", analysis.errors.len()));
@@ -619,6 +676,46 @@ pub fn generate_summary_report(analysis: &CallAnalysis) -> String {
     // Room info
     lines.push(format!("room_id={}", analysis.room_id));
     lines.push(format!("agent={}", analysis.agent_name));
+
+    // Span-derived metrics
+    let sm = &analysis.span_metrics;
+    if !sm.llm_model.is_empty() {
+        lines.push(format!("llm_model={}", sm.llm_model));
+    }
+    if !sm.tts_provider.is_empty() {
+        lines.push(format!("tts_provider={}", sm.tts_provider));
+    }
+    if sm.llm_request_count > 0 {
+        lines.push(format!("llm_requests={}", sm.llm_request_count));
+        lines.push(format!("total_prompt_tokens={}", sm.total_prompt_tokens));
+        lines.push(format!("total_completion_tokens={}", sm.total_completion_tokens));
+        lines.push(format!("cache_hit_pct={:.1}", sm.cache_hit_pct));
+        if sm.avg_tokens_per_sec > 0.0 {
+            lines.push(format!("avg_tokens_per_sec={:.1}", sm.avg_tokens_per_sec));
+            lines.push(format!("min_tokens_per_sec={:.1}", sm.min_tokens_per_sec));
+        }
+        if sm.cancelled_llm_count > 0 {
+            lines.push(format!("cancelled_llm_requests={}", sm.cancelled_llm_count));
+        }
+    }
+    if sm.tts_request_count > 0 {
+        lines.push(format!("tts_requests={}", sm.tts_request_count));
+        if sm.avg_tts_realtime_factor > 0.0 {
+            lines.push(format!("tts_realtime_factor={:.1}", sm.avg_tts_realtime_factor));
+        }
+        if sm.cancelled_tts_count > 0 {
+            lines.push(format!("cancelled_tts_requests={}", sm.cancelled_tts_count));
+        }
+    }
+    if sm.eou_count > 0 {
+        lines.push(format!("eou_detections={}", sm.eou_count));
+        lines.push(format!("eou_high_confidence={}", sm.eou_high_confidence_count));
+        lines.push(format!("eou_low_confidence={}", sm.eou_low_confidence_count));
+        lines.push(format!("eou_avg_probability={:.3}", sm.eou_avg_probability));
+        if sm.eou_endpointing_delay > 0.0 {
+            lines.push(format!("eou_endpointing_delay_sec={:.1}", sm.eou_endpointing_delay));
+        }
+    }
 
     lines.join("\n")
 }
@@ -881,6 +978,31 @@ fn generate_text_report_impl(analysis: &CallAnalysis, use_color: bool) -> String
         ));
     }
     lines.push(String::new());
+
+    // Model & Provider
+    let sm = &analysis.span_metrics;
+    if sm.llm_request_count > 0 || sm.tts_request_count > 0 {
+        lines.push(c("MODEL & PROVIDER", &colors(&[Colors::BOLD, Colors::BLUE])));
+        lines.push(c(&"-".repeat(40), Colors::DIM));
+        if !sm.llm_model.is_empty() {
+            lines.push(format!("  LLM:  {} ({} reqs, {:.1} tok/s avg)",
+                sm.llm_model, sm.llm_request_count, sm.avg_tokens_per_sec));
+        }
+        if !sm.tts_provider.is_empty() {
+            lines.push(format!("  TTS:  {} ({} reqs, {:.1}x realtime)",
+                sm.tts_provider, sm.tts_request_count, sm.avg_tts_realtime_factor));
+        }
+        if sm.total_prompt_tokens > 0 {
+            lines.push(format!("  Tokens: {}K prompt ({:.0}% cached), {}K completion",
+                sm.total_prompt_tokens / 1000, sm.cache_hit_pct, sm.total_completion_tokens / 1000));
+        }
+        if sm.eou_count > 0 {
+            lines.push(format!("  EOU:  {}/{} high confidence, avg prob={:.3}, delay={:.1}s",
+                sm.eou_high_confidence_count, sm.eou_count,
+                sm.eou_avg_probability, sm.eou_endpointing_delay));
+        }
+        lines.push(String::new());
+    }
 
     // System Prompt
     if !analysis.system_prompt.is_empty() {
@@ -1328,9 +1450,20 @@ pub struct JsonTurnMetrics {
 #[derive(Debug, Serialize)]
 pub struct JsonTurn {
     pub index: usize,
+    pub turn_type: String,
     pub role: Option<String>,
     pub text: String,
     pub interrupted: bool,
+    pub created_at: f64,
+    pub relative_time_sec: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_arguments: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_output: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gap_from_previous_sec: Option<f64>,
     pub metrics: JsonTurnMetrics,
 }
 
@@ -1364,6 +1497,29 @@ pub struct JsonDiagnosis {
     pub tool_errors: usize,
 }
 
+/// JSON report structure for span-derived metrics.
+#[derive(Debug, Serialize)]
+pub struct JsonSpanMetrics {
+    pub llm_model: String,
+    pub tts_provider: String,
+    pub llm_requests: usize,
+    pub total_prompt_tokens: u64,
+    pub total_completion_tokens: u64,
+    pub total_cached_tokens: u64,
+    pub cache_hit_pct: f64,
+    pub avg_tokens_per_sec: f64,
+    pub min_tokens_per_sec: f64,
+    pub cancelled_llm_requests: usize,
+    pub tts_requests: usize,
+    pub avg_tts_realtime_factor: f64,
+    pub cancelled_tts_requests: usize,
+    pub eou_detections: usize,
+    pub eou_high_confidence: usize,
+    pub eou_low_confidence: usize,
+    pub eou_avg_probability: f64,
+    pub eou_endpointing_delay_sec: f64,
+}
+
 /// Complete JSON report structure.
 #[derive(Debug, Serialize)]
 pub struct JsonReport {
@@ -1371,6 +1527,7 @@ pub struct JsonReport {
     pub summary: JsonSummary,
     pub diagnosis: Option<JsonDiagnosis>,
     pub latency: JsonLatency,
+    pub span_metrics: JsonSpanMetrics,
     pub turns: Vec<JsonTurn>,
     pub high_latency_turns: Vec<JsonHighLatencyTurn>,
     pub errors: Vec<JsonError>,
@@ -1387,35 +1544,75 @@ fn build_json_report(analysis: &CallAnalysis) -> JsonReport {
     // Compute latency stats using centralized method
     let (e2e_stats, llm_stats, tts_stats) = analysis.compute_latency_stats();
 
-    // Build turns
+    // Build turns (include all turn types with timestamps)
+    let mut prev_created_at: Option<f64> = None;
     let turns: Vec<JsonTurn> = analysis
         .turns
         .iter()
         .enumerate()
-        .filter(|(_, t)| t.turn_type == "message")
-        .map(|(i, t)| JsonTurn {
-            index: i + 1,
-            role: t.role.clone(),
-            text: t.text(),
-            interrupted: t.interrupted,
-            metrics: JsonTurnMetrics {
-                e2e_latency_ms: t.metrics.e2e_latency.map(|v| v * 1000.0),
-                llm_ttft_ms: t.metrics.llm_node_ttft.map(|v| v * 1000.0),
-                tts_ttfb_ms: t.metrics.tts_node_ttfb.map(|v| v * 1000.0),
-                speaking_duration_sec: t.metrics.speaking_duration(),
-                transcript_confidence: t.metrics.transcript_confidence,
-                breakdown: t.breakdown.as_ref().map(|b| JsonTurnBreakdown {
-                    stt_ms: b.stt_ms,
-                    eol_ms: b.eol_ms,
-                    first_llm_ms: b.first_llm_ms,
-                    tool_ms: b.tool_ms,
-                    tool_names: b.tool_names.clone(),
-                    llm_ms: b.llm_ms,
-                    tts_ms: b.tts_ms,
-                    overhead_ms: b.overhead_ms,
-                    has_tool_call: b.has_tool_call,
-                }),
-            },
+        .map(|(i, t)| {
+            let gap = prev_created_at
+                .filter(|&prev| prev > 0.0 && t.created_at > 0.0)
+                .map(|prev| t.created_at - prev);
+            prev_created_at = Some(t.created_at);
+
+            // Extract tool info for function_call / function_call_output turns
+            let (tool_name, tool_arguments, tool_output) = match t.turn_type.as_str() {
+                "function_call" => (
+                    t.extra.get("name").and_then(|v| v.as_str()).map(String::from),
+                    t.extra.get("arguments").map(|v| {
+                        if let Some(s) = v.as_str() { s.to_string() } else { v.to_string() }
+                    }),
+                    None,
+                ),
+                "function_call_output" => (
+                    t.extra.get("name").and_then(|v| v.as_str()).map(String::from),
+                    None,
+                    t.extra.get("output").and_then(|v| v.as_str()).map(String::from),
+                ),
+                _ => (None, None, None),
+            };
+
+            let text = match t.turn_type.as_str() {
+                "function_call" | "function_call_output" | "agent_handoff" => String::new(),
+                _ => t.text(),
+            };
+
+            JsonTurn {
+                index: i + 1,
+                turn_type: t.turn_type.clone(),
+                role: t.role.clone(),
+                text,
+                interrupted: t.interrupted,
+                created_at: t.created_at,
+                relative_time_sec: if analysis.session_start > 0.0 && t.created_at > 0.0 {
+                    t.created_at - analysis.session_start
+                } else {
+                    0.0
+                },
+                tool_name,
+                tool_arguments,
+                tool_output,
+                gap_from_previous_sec: gap.filter(|&g| g > 0.5),
+                metrics: JsonTurnMetrics {
+                    e2e_latency_ms: t.metrics.e2e_latency.map(|v| v * 1000.0),
+                    llm_ttft_ms: t.metrics.llm_node_ttft.map(|v| v * 1000.0),
+                    tts_ttfb_ms: t.metrics.tts_node_ttfb.map(|v| v * 1000.0),
+                    speaking_duration_sec: t.metrics.speaking_duration(),
+                    transcript_confidence: t.metrics.transcript_confidence,
+                    breakdown: t.breakdown.as_ref().map(|b| JsonTurnBreakdown {
+                        stt_ms: b.stt_ms,
+                        eol_ms: b.eol_ms,
+                        first_llm_ms: b.first_llm_ms,
+                        tool_ms: b.tool_ms,
+                        tool_names: b.tool_names.clone(),
+                        llm_ms: b.llm_ms,
+                        tts_ms: b.tts_ms,
+                        overhead_ms: b.overhead_ms,
+                        has_tool_call: b.has_tool_call,
+                    }),
+                },
+            }
         })
         .collect();
 
@@ -1466,6 +1663,8 @@ fn build_json_report(analysis: &CallAnalysis) -> JsonReport {
         }
     });
 
+    let sm = &analysis.span_metrics;
+
     JsonReport {
         metadata: JsonMetadata {
             room_id: analysis.room_id.clone(),
@@ -1491,6 +1690,26 @@ fn build_json_report(analysis: &CallAnalysis) -> JsonReport {
             e2e: JsonLatencyStats::from(e2e_stats.as_ref()),
             llm_ttft: JsonLatencyStats::from(llm_stats.as_ref()),
             tts_ttfb: JsonLatencyStats::from(tts_stats.as_ref()),
+        },
+        span_metrics: JsonSpanMetrics {
+            llm_model: sm.llm_model.clone(),
+            tts_provider: sm.tts_provider.clone(),
+            llm_requests: sm.llm_request_count,
+            total_prompt_tokens: sm.total_prompt_tokens,
+            total_completion_tokens: sm.total_completion_tokens,
+            total_cached_tokens: sm.total_cached_tokens,
+            cache_hit_pct: sm.cache_hit_pct,
+            avg_tokens_per_sec: sm.avg_tokens_per_sec,
+            min_tokens_per_sec: sm.min_tokens_per_sec,
+            cancelled_llm_requests: sm.cancelled_llm_count,
+            tts_requests: sm.tts_request_count,
+            avg_tts_realtime_factor: sm.avg_tts_realtime_factor,
+            cancelled_tts_requests: sm.cancelled_tts_count,
+            eou_detections: sm.eou_count,
+            eou_high_confidence: sm.eou_high_confidence_count,
+            eou_low_confidence: sm.eou_low_confidence_count,
+            eou_avg_probability: sm.eou_avg_probability,
+            eou_endpointing_delay_sec: sm.eou_endpointing_delay,
         },
         turns,
         high_latency_turns,
