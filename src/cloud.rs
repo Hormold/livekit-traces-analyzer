@@ -234,7 +234,10 @@ pub struct Participant {
 
 fn api_get<T: serde::de::DeserializeOwned>(token: &str, path: &str) -> Result<T> {
     let url = format!("{}{}", CLOUD_API_BASE, path);
-    let client = reqwest::blocking::Client::new();
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
     let resp = client
         .get(&url)
         .header("Authorization", format!("Bearer {}", token))
@@ -392,7 +395,9 @@ fn try_download_otlp_zip(
     );
 
     let client = reqwest::blocking::Client::builder()
-        .user_agent("livekit-analyzer/0.4")
+        .user_agent("livekit-analyzer/0.5")
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(300)) // 5 min for large ZIPs
         .build()?;
 
     let resp = client
@@ -459,8 +464,8 @@ fn try_download_otlp_zip(
     Ok(true)
 }
 
-/// Download OTLP ZIP with automatic token retry.
-/// If the token is expired, clears saved token and prompts for a new one.
+/// Download OTLP ZIP with automatic token retry and network retry.
+/// Retries up to 3 times on network errors, and re-prompts on auth failure.
 fn download_otlp_zip(
     session_token: &str,
     project_id: &str,
@@ -469,28 +474,52 @@ fn download_otlp_zip(
 ) -> Result<()> {
     eprintln!("[2/2] Downloading OTLP data...");
 
-    // First attempt with current token
-    if try_download_otlp_zip(session_token, project_id, session_id, output_dir)? {
-        return Ok(());
+    let mut token = session_token.to_string();
+    let max_retries = 3;
+
+    for attempt in 1..=max_retries {
+        match try_download_otlp_zip(&token, project_id, session_id, output_dir) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {
+                // Token expired — clear saved token and re-prompt
+                eprintln!("Session token expired or invalid.");
+                clear_session_token();
+
+                let new_token = prompt_session_token()?;
+                save_session_token(&new_token)?;
+                eprintln!("Token saved to {}", token_path().display());
+                eprintln!("Retrying download...");
+                token = new_token;
+
+                match try_download_otlp_zip(&token, project_id, session_id, output_dir) {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => bail!(
+                        "Authentication failed. Make sure you copied the correct cookie value.\n\
+                         Cookie name: __Secure-authjs.browser-session-token"
+                    ),
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(e) => {
+                if attempt < max_retries {
+                    let delay = attempt * 2;
+                    eprintln!(
+                        "      Download failed (attempt {}/{}): {}",
+                        attempt, max_retries, e
+                    );
+                    eprintln!("      Retrying in {}s...", delay);
+                    std::thread::sleep(std::time::Duration::from_secs(delay as u64));
+                } else {
+                    return Err(e).context(format!(
+                        "Download failed after {} attempts. The ZIP file may be too large or the network is slow.",
+                        max_retries
+                    ));
+                }
+            }
+        }
     }
 
-    // Token expired — clear saved token and re-prompt
-    eprintln!("Session token expired or invalid.");
-    clear_session_token();
-
-    let new_token = prompt_session_token()?;
-    save_session_token(&new_token)?;
-    eprintln!("Token saved to {}", token_path().display());
-    eprintln!("Retrying download...");
-
-    if try_download_otlp_zip(&new_token, project_id, session_id, output_dir)? {
-        return Ok(());
-    }
-
-    bail!(
-        "Authentication failed. Make sure you copied the correct cookie value.\n\
-         Cookie name: __Secure-authjs.browser-session-token"
-    );
+    unreachable!()
 }
 
 pub fn download_session(
