@@ -11,6 +11,7 @@ mod parser;
 mod pcap;
 mod report;
 mod thresholds;
+mod timeline;
 mod ui;
 
 use std::env;
@@ -51,6 +52,7 @@ enum ReportMode {
     Spans,
     Transcript,
     Dump,
+    Timeline,
     Pcap,
 }
 
@@ -73,6 +75,7 @@ fn print_usage(program: &str) {
     eprintln!("  --spans             All spans with timing");
     eprintln!("  --transcript        Conversation transcript only");
     eprintln!("  --dump              Everything: summary + transcript + logs + spans");
+    eprintln!("  --timeline          Chronological BREAKDOWN.md (agent-optimized)");
     eprintln!("  --pcap              PCAP analysis only (SIP/RTP)");
     eprintln!();
     eprintln!("Other Options:");
@@ -129,6 +132,9 @@ fn parse_args() -> Result<CliOptions, String> {
             }
             "--dump" => {
                 report_mode = ReportMode::Dump;
+            }
+            "--timeline" => {
+                report_mode = ReportMode::Timeline;
             }
             "--pcap" => {
                 report_mode = ReportMode::Pcap;
@@ -226,7 +232,8 @@ fn main() -> Result<()> {
             run_tui(app)?;
         }
         ReportMode::Text | ReportMode::Json | ReportMode::Summary
-        | ReportMode::Logs | ReportMode::Spans | ReportMode::Transcript | ReportMode::Dump => {
+        | ReportMode::Logs | ReportMode::Spans | ReportMode::Transcript
+        | ReportMode::Dump | ReportMode::Timeline => {
             // Load and analyze the data
             let analysis = analyze_call(traces_folder)
                 .with_context(|| format!("Failed to analyze folder: {}", traces_folder.display()))?;
@@ -247,6 +254,7 @@ fn main() -> Result<()> {
                 ReportMode::Spans => report::generate_spans_report(&analysis),
                 ReportMode::Transcript => report::generate_transcript_report(&analysis),
                 ReportMode::Dump => report::generate_dump_report(&analysis),
+                ReportMode::Timeline => timeline::generate_timeline_report(&analysis),
                 _ => unreachable!(),
             };
 

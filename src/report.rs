@@ -7,11 +7,11 @@ use std::io::IsTerminal;
 
 use serde::Serialize;
 
-use crate::data::{CallAnalysis, DiagnosisVerdict, LatencyStats, PipelineSummary, Severity};
+use crate::data::{CallAnalysis, DiagnosisVerdict, LatencyStats, LogEntry, PipelineSummary, Severity};
 use crate::format::{format_duration, format_ms, word_wrap, truncate};
 use crate::thresholds::{
     self, CAUSE_ICONS,
-    MAX_SLOW_TURNS_PER_CAUSE, MAX_WARNINGS_DISPLAY, MAX_TOOL_CALLS_DISPLAY,
+    MAX_SLOW_TURNS_PER_CAUSE, MAX_TOOL_CALLS_DISPLAY,
     MAX_SPANS_DISPLAY, MAX_DETECTED_DELAYS,
     TEXT_PREVIEW_MEDIUM, TEXT_PREVIEW_LONG,
     cause_label,
@@ -64,6 +64,72 @@ fn severity_to_ansi(severity: Severity) -> &'static str {
         Severity::Warning => Colors::YELLOW,
         Severity::Critical => Colors::RED,
     }
+}
+
+// =============================================================================
+// WARNING GROUPING
+// =============================================================================
+
+/// A group of similar warnings.
+struct WarningGroup {
+    label: String,
+    logger: String,
+    count: usize,
+    first_time: f64,
+    last_time: f64,
+    /// (relative_time, full_message)
+    entries: Vec<(f64, String)>,
+}
+
+/// Normalize a warning message to a grouping key by stripping variable parts
+/// (numbers, UUIDs, hex strings, timestamps).
+fn warning_group_key(logger: &str, message: &str) -> String {
+    use std::sync::LazyLock;
+    use regex::Regex;
+
+    static RE_HEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[0-9a-fA-F]{6,}").unwrap());
+    static RE_NUM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\d+(\.\d+)?\b").unwrap());
+
+    let short: String = message.chars().take(80).collect();
+    let key = RE_HEX.replace_all(&short, "<ID>").to_string();
+    let key = RE_NUM.replace_all(&key, "<N>").to_string();
+    format!("{}::{}", logger, key)
+}
+
+/// Group warnings by similar message pattern.
+fn group_warnings(warnings: &[LogEntry], session_start: f64) -> Vec<WarningGroup> {
+    let mut groups: Vec<WarningGroup> = Vec::new();
+    let mut key_to_idx: HashMap<String, usize> = HashMap::new();
+
+    for log in warnings {
+        let rel_time = log.timestamp_sec() - session_start;
+        let key = warning_group_key(&log.logger_name, &log.message);
+        let full_msg = log.message.replace('\n', " | ");
+
+        if let Some(&idx) = key_to_idx.get(&key) {
+            let g = &mut groups[idx];
+            g.count += 1;
+            if rel_time < g.first_time { g.first_time = rel_time; }
+            if rel_time > g.last_time { g.last_time = rel_time; }
+            g.entries.push((rel_time, full_msg));
+        } else {
+            let label = truncate(&full_msg, 100);
+            let idx = groups.len();
+            key_to_idx.insert(key, idx);
+            groups.push(WarningGroup {
+                label,
+                logger: log.logger_name.clone(),
+                count: 1,
+                first_time: rel_time,
+                last_time: rel_time,
+                entries: vec![(rel_time, full_msg)],
+            });
+        }
+    }
+
+    // Sort by count descending (most frequent first)
+    groups.sort_by(|a, b| b.count.cmp(&a.count));
+    groups
 }
 
 /// Generate pipeline analysis text section using PipelineSummary.
@@ -502,24 +568,31 @@ pub fn generate_dump_report(analysis: &CallAnalysis) -> String {
     }
     parts.push(String::new());
 
-    // Warnings
+    // Warnings (grouped by similar message)
     if !analysis.warnings.is_empty() {
         parts.push("=".repeat(80));
-        parts.push(format!("# WARNINGS ({} total)", analysis.warnings.len()));
+        parts.push(format!("# WARNINGS ({} total, grouped)", analysis.warnings.len()));
         parts.push(String::new());
 
-        for log in analysis.warnings.iter().take(20) {
-            let rel_time = log.timestamp_sec() - analysis.session_start;
-            parts.push(format!("{:>7.2}s  {} | {}",
-                rel_time,
-                log.logger_name,
-                truncate(&log.message.replace('\n', " | "), 100)
-            ));
+        let groups = group_warnings(&analysis.warnings, analysis.session_start);
+        for group in &groups {
+            parts.push(format!("## {} (x{})", group.label, group.count));
+            parts.push(format!("   Source: {}", group.logger));
+            parts.push(format!("   First: {:.2}s  Last: {:.2}s", group.first_time, group.last_time));
+            if group.count <= 3 {
+                for entry in &group.entries {
+                    parts.push(format!("   {:>7.2}s  {}", entry.0, entry.1));
+                }
+            } else {
+                // Show first, then "... N more ...", then last
+                let first = &group.entries[0];
+                let last = &group.entries[group.entries.len() - 1];
+                parts.push(format!("   {:>7.2}s  {}", first.0, first.1));
+                parts.push(format!("   ... {} more occurrences ...", group.count - 2));
+                parts.push(format!("   {:>7.2}s  {}", last.0, last.1));
+            }
+            parts.push(String::new());
         }
-        if analysis.warnings.len() > 20 {
-            parts.push(format!("... and {} more warnings", analysis.warnings.len() - 20));
-        }
-        parts.push(String::new());
     }
 
     // Key spans only (not all spans - too verbose)
@@ -1195,25 +1268,41 @@ fn generate_text_report_impl(analysis: &CallAnalysis, use_color: bool) -> String
         lines.push(String::new());
     }
 
-    // Warnings
+    // Warnings (grouped by similar message)
     if !analysis.warnings.is_empty() {
-        lines.push(c("WARNINGS", &colors(&[Colors::BOLD, Colors::YELLOW])));
+        lines.push(c(
+            &format!("WARNINGS ({} total, grouped)", analysis.warnings.len()),
+            &colors(&[Colors::BOLD, Colors::YELLOW]),
+        ));
         lines.push(c(&"-".repeat(80), Colors::DIM));
-        for log in analysis.warnings.iter().take(MAX_WARNINGS_DISPLAY) {
-            let rel_time = log.timestamp_sec() - analysis.session_start;
+
+        let groups = group_warnings(&analysis.warnings, analysis.session_start);
+        for group in &groups {
             lines.push(c(
-                &format!("  [{}] {}", format_duration(rel_time), log.logger_name),
-                Colors::YELLOW,
+                &format!("  {} (x{})", group.label, group.count),
+                &colors(&[Colors::YELLOW, Colors::BOLD]),
             ));
-            lines.push(format!("    {}", truncate(&log.message, TEXT_PREVIEW_LONG)));
-        }
-        if analysis.warnings.len() > MAX_WARNINGS_DISPLAY {
             lines.push(c(
-                &format!("  ... and {} more warnings", analysis.warnings.len() - MAX_WARNINGS_DISPLAY),
+                &format!("    Source: {}  |  First: {:.2}s  Last: {:.2}s",
+                    group.logger, group.first_time, group.last_time),
                 Colors::DIM,
             ));
+            if group.count <= 3 {
+                for entry in &group.entries {
+                    lines.push(format!("    [{:.2}s] {}", entry.0, entry.1));
+                }
+            } else {
+                let first = &group.entries[0];
+                let last = &group.entries[group.entries.len() - 1];
+                lines.push(format!("    [{:.2}s] {}", first.0, first.1));
+                lines.push(c(
+                    &format!("    ... {} more occurrences ...", group.count - 2),
+                    Colors::DIM,
+                ));
+                lines.push(format!("    [{:.2}s] {}", last.0, last.1));
+            }
+            lines.push(String::new());
         }
-        lines.push(String::new());
     }
 
     // Tool Calls

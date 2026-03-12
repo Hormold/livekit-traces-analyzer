@@ -34,6 +34,9 @@ livekit-analyzer ./traces -r
 # Everything combined (best for diagnosis)
 livekit-analyzer ./traces --dump
 
+# Chronological timeline (BREAKDOWN.md, best for agents)
+livekit-analyzer ./traces --timeline
+
 # PCAP network analysis only
 livekit-analyzer ./call.pcap --pcap
 
@@ -82,6 +85,90 @@ agent=voice-agent
 - `llm_pct` / `tts_pct` - Where time is spent
 
 ## Other Output Formats
+
+### --timeline (Chronological BREAKDOWN.md — Best for Agents)
+
+Generates a Markdown file that interleaves **all events** chronologically:
+logs, conversation turns, tool calls, handoffs, and latency breakdowns.
+Every assistant turn includes inline metrics, E2E breakdowns, and `[SLOW: ...]`
+annotations. This is the format described in `docs/agent-friendly-debugging.md`.
+
+```markdown
+# Call Breakdown: RM_DRewYSCiKoEK
+
+**Verdict: PROBLEMATIC — 28 slow turns, 2 errors, 69 warnings**
+
+| Field | Value |
+|---|---|
+| Room ID | RM_DRewYSCiKoEK |
+| Duration | 18:28.3 |
+| Agent | onboarding-agent-production |
+| ...   | ... |
+
+## Pipeline
+
+Response time: **2.2s avg** (max 4.7s) — slow
+
+| Stage | Avg | % of total | Verdict |
+|---|---|---|---|
+| LLM (TTFT) | 876ms | 39% | normal |
+| TTS (TTFB) | 380ms | 17% | fast |
+
+Bottleneck: **Overhead/gaps dominate**
+
+## Timeline
+
+### 0.00s — LOG [WARN] dating-onboarding
+> ENTRYPOINT V2 - 2026-02-16
+
+### Turn 1 — HANDOFF to GreetingAgent
+
+### Turn 2 — ASSISTANT
+- E2E: 633ms | LLM: 633ms | TTS: 218ms
+
+> Hey, you're here because swiping isn't cutting it anymore.
+
+---
+
+### Turn 3 — USER
+> Ready.
+
+---
+
+### Turn 4 — TOOL: start_interview()
+- Output: ok
+
+---
+
+### Turn 9 — ASSISTANT
+- **E2E: 4121ms** | LLM: 1034ms | TTS: 445ms
+- Breakdown: stt=225ms -> eol=751ms -> llm1=1839ms -> tool=1ms[record_answer] -> llm2=1034ms -> tts=445ms
+- **[SLOW: overhead — llm1=1839ms deciding to call tool]**
+
+> Mumbai and New York... that's a mix.
+
+## Errors (2)
+| Time | Source | Message |
+|---:|---|---|
+| 0.50s | webhook | Webhook client error: 404 |
+
+## Warnings (69 total, grouped by pattern)
+| Count | Pattern | Source | First | Last |
+|---:|---|---|---|---|
+| 19 | Section budget exhausted | dating-onboarding | 9:23.3 | 18:01.7 |
+
+## Latency Stats
+| Metric | Avg | Min | Max | P95 |
+|---|---|---|---|---|
+| E2E | 2229ms | 960ms | 4738ms | 4121ms |
+```
+
+**Key features for agents:**
+- Everything in one file, chronological order
+- Slow turns marked with `**[SLOW: reason]**`
+- Tool calls show inline with arguments and output
+- Logs interleaved at their exact timestamp
+- Breakdowns show the full pipeline: `stt -> eol -> llm1 -> tool -> llm2 -> tts`
 
 ### --transcript (Conversation Only)
 ```
@@ -709,6 +796,7 @@ Recommendations:
 | Text | `-r` | Human reading |
 | JSON | `--json` | Programmatic use |
 | Transcript | `--transcript` | Conversation review |
+| Timeline | `--timeline` | Agent-friendly BREAKDOWN.md |
 | Logs | `--logs` | Error investigation |
 | Spans | `--spans` | Timing deep-dive |
 | PCAP | `--pcap` | Network-only analysis |

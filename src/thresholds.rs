@@ -83,8 +83,6 @@ pub const CONFIDENCE_WARN_PCT: f64 = 85.0;
 
 /// Max slow turns to show per cause in diagnosis.
 pub const MAX_SLOW_TURNS_PER_CAUSE: usize = 3;
-/// Max warnings to show in report.
-pub const MAX_WARNINGS_DISPLAY: usize = 10;
 /// Max tool calls to show in timeline.
 pub const MAX_TOOL_CALLS_DISPLAY: usize = 15;
 /// Max spans to show in timeline.

@@ -66,9 +66,14 @@ pub fn resolve_project<'a>(config: &'a CliConfig, name: Option<&str>) -> Result<
         Some(n) => config
             .projects
             .iter()
-            .find(|p| p.name == n)
+            .find(|p| p.name == n || p.project_id.as_deref() == Some(n))
             .with_context(|| {
-                let available: Vec<&str> = config.projects.iter().map(|p| p.name.as_str()).collect();
+                let available: Vec<String> = config.projects.iter().map(|p| {
+                    match &p.project_id {
+                        Some(id) => format!("{} ({})", p.name, id),
+                        None => p.name.clone(),
+                    }
+                }).collect();
                 format!(
                     "Project '{}' not found. Available: {}",
                     n,
@@ -498,13 +503,19 @@ pub fn download_session(
     std::fs::create_dir_all(output_dir)
         .with_context(|| format!("Failed to create output dir: {}", output_dir.display()))?;
 
-    // Save session metadata (uses JWT — always works)
+    // Save session metadata (uses JWT — may fail on non-Scale plans)
     eprintln!("[1/2] Fetching session metadata...");
-    let detail = get_session_detail(jwt_token, project_id, session_id)?;
-    let metadata_path = output_dir.join("metadata.json");
-    let metadata_json = serde_json::to_string_pretty(&detail)?;
-    std::fs::write(&metadata_path, &metadata_json)?;
-    eprintln!("      Saved {}", metadata_path.display());
+    match get_session_detail(jwt_token, project_id, session_id) {
+        Ok(detail) => {
+            let metadata_path = output_dir.join("metadata.json");
+            let metadata_json = serde_json::to_string_pretty(&detail)?;
+            std::fs::write(&metadata_path, &metadata_json)?;
+            eprintln!("      Saved {}", metadata_path.display());
+        }
+        Err(e) => {
+            eprintln!("      Warning: metadata fetch failed ({}), continuing with OTLP download...", e);
+        }
+    }
 
     // Download OTLP ZIP (requires session token)
     download_otlp_zip(session_token, project_id, session_id, output_dir)?;
