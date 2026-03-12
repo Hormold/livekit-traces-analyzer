@@ -2,7 +2,6 @@
 //!
 //! This module provides a single source of truth for all latency thresholds
 //! used across the application (TUI, reports, analysis).
-
 use crate::data::Severity;
 
 // =============================================================================
@@ -56,9 +55,9 @@ pub const TOTAL_WARN_MS: f64 = 8000.0;
 // TOOL CALL THRESHOLDS
 // =============================================================================
 
-/// Tool call duration below this is fast (green).
+#[allow(dead_code)]
 pub const TOOL_GOOD_MS: f64 = 100.0;
-/// Tool call duration below this is acceptable (yellow), above is slow (red).
+#[allow(dead_code)]
 pub const TOOL_WARN_MS: f64 = 500.0;
 
 // =============================================================================
@@ -72,9 +71,10 @@ pub const GAP_SIGNIFICANT_MS: f64 = 500.0;
 // CONFIDENCE THRESHOLDS (Transcript confidence)
 // =============================================================================
 
-/// Confidence above this is good (green).
+#[allow(dead_code)]
 pub const CONFIDENCE_GOOD_PCT: f64 = 95.0;
 /// Confidence above this is acceptable (yellow), below is poor (red).
+#[allow(dead_code)]
 pub const CONFIDENCE_WARN_PCT: f64 = 85.0;
 
 // =============================================================================
@@ -83,8 +83,6 @@ pub const CONFIDENCE_WARN_PCT: f64 = 85.0;
 
 /// Max slow turns to show per cause in diagnosis.
 pub const MAX_SLOW_TURNS_PER_CAUSE: usize = 3;
-/// Max warnings to show in report.
-pub const MAX_WARNINGS_DISPLAY: usize = 10;
 /// Max tool calls to show in timeline.
 pub const MAX_TOOL_CALLS_DISPLAY: usize = 15;
 /// Max spans to show in timeline.
@@ -158,6 +156,7 @@ pub fn total_severity(ms: f64) -> Severity {
 }
 
 /// Get severity for tool call duration (in milliseconds).
+#[allow(dead_code)]
 pub fn tool_severity(ms: f64) -> Severity {
     if ms < TOOL_GOOD_MS {
         Severity::Good
@@ -169,6 +168,7 @@ pub fn tool_severity(ms: f64) -> Severity {
 }
 
 /// Get severity for transcript confidence (in percentage 0-100).
+#[allow(dead_code)]
 pub fn confidence_severity(pct: f64) -> Severity {
     if pct > CONFIDENCE_GOOD_PCT {
         Severity::Good

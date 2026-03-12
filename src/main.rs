@@ -2,6 +2,7 @@
 
 mod analysis;
 mod app;
+mod cloud;
 mod data;
 mod events;
 mod format;
@@ -10,6 +11,7 @@ mod parser;
 mod pcap;
 mod report;
 mod thresholds;
+mod timeline;
 mod ui;
 
 use std::env;
@@ -50,6 +52,7 @@ enum ReportMode {
     Spans,
     Transcript,
     Dump,
+    Timeline,
     Pcap,
 }
 
@@ -72,11 +75,18 @@ fn print_usage(program: &str) {
     eprintln!("  --spans             All spans with timing");
     eprintln!("  --transcript        Conversation transcript only");
     eprintln!("  --dump              Everything: summary + transcript + logs + spans");
+    eprintln!("  --timeline          Chronological BREAKDOWN.md (agent-optimized)");
     eprintln!("  --pcap              PCAP analysis only (SIP/RTP)");
     eprintln!();
     eprintln!("Other Options:");
     eprintln!("  -o, --output <file> Write report to file instead of stdout");
     eprintln!("  -h, --help          Show this help message");
+    eprintln!();
+    eprintln!("Cloud (experimental):");
+    eprintln!("  cloud projects      List LiveKit Cloud projects");
+    eprintln!("  cloud sessions      List recent sessions");
+    eprintln!("  cloud download <ID> Download session observability data");
+    eprintln!("  cloud --help        Full cloud help");
     eprintln!();
     eprintln!("Examples:");
     eprintln!("  {} ./observability-RM_xxx", program);
@@ -123,6 +133,9 @@ fn parse_args() -> Result<CliOptions, String> {
             "--dump" => {
                 report_mode = ReportMode::Dump;
             }
+            "--timeline" => {
+                report_mode = ReportMode::Timeline;
+            }
             "--pcap" => {
                 report_mode = ReportMode::Pcap;
             }
@@ -155,6 +168,26 @@ fn parse_args() -> Result<CliOptions, String> {
 }
 
 fn main() -> Result<()> {
+    // Check for `cloud` subcommand before normal parsing
+    let args: Vec<String> = env::args().collect();
+    if args.len() > 1 && args[1] == "cloud" {
+        let cloud_args = &args[2..];
+        let cloud_opts = match cloud::parse_cloud_args(cloud_args) {
+            Ok(opts) => opts,
+            Err(e) if e == "show_help" => {
+                cloud::print_cloud_help();
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                eprintln!();
+                cloud::print_cloud_help();
+                std::process::exit(1);
+            }
+        };
+        return cloud::run(cloud_opts);
+    }
+
     // Parse command line arguments
     let options = match parse_args() {
         Ok(opts) => opts,
@@ -199,7 +232,8 @@ fn main() -> Result<()> {
             run_tui(app)?;
         }
         ReportMode::Text | ReportMode::Json | ReportMode::Summary
-        | ReportMode::Logs | ReportMode::Spans | ReportMode::Transcript | ReportMode::Dump => {
+        | ReportMode::Logs | ReportMode::Spans | ReportMode::Transcript
+        | ReportMode::Dump | ReportMode::Timeline => {
             // Load and analyze the data
             let analysis = analyze_call(traces_folder)
                 .with_context(|| format!("Failed to analyze folder: {}", traces_folder.display()))?;
@@ -220,6 +254,7 @@ fn main() -> Result<()> {
                 ReportMode::Spans => report::generate_spans_report(&analysis),
                 ReportMode::Transcript => report::generate_transcript_report(&analysis),
                 ReportMode::Dump => report::generate_dump_report(&analysis),
+                ReportMode::Timeline => timeline::generate_timeline_report(&analysis),
                 _ => unreachable!(),
             };
 
