@@ -309,18 +309,25 @@ fn save_session_token(token: &str) -> Result<()> {
 }
 
 /// Prompt the user interactively to paste their session token.
+///
+/// Reads one line from stdin. That line can also be piped in, so the token can
+/// be supplied without a terminal: `echo "$T" | livekit-analyzer cloud login`.
+/// The instructions are only printed when stdin is a terminal.
 fn prompt_session_token() -> Result<String> {
-    eprintln!();
-    eprintln!("Session token required for downloading observability data.");
-    eprintln!();
-    eprintln!("To get it:");
-    eprintln!("  1. Open https://cloud.livekit.io and log in");
-    eprintln!("  2. Open DevTools (F12) → Application → Cookies → cloud.livekit.io");
-    eprintln!("  3. Find `__Secure-authjs.browser-session-token`");
-    eprintln!("  4. Double-click the Value column and copy it");
-    eprintln!();
-    eprint!("Paste token: ");
-    std::io::stderr().flush()?;
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        eprintln!();
+        eprintln!("Session token required for downloading observability data.");
+        eprintln!();
+        eprintln!("To get it:");
+        eprintln!("  1. Open https://cloud.livekit.io and log in");
+        eprintln!("  2. Open DevTools (F12) → Application → Cookies → cloud.livekit.io");
+        eprintln!("  3. Find `__Secure-authjs.browser-session-token`");
+        eprintln!("  4. Double-click the Value column and copy it");
+        eprintln!();
+        eprint!("Paste token: ");
+        std::io::stderr().flush()?;
+    }
 
     let mut token = String::new();
     std::io::stdin().read_line(&mut token).context("Failed to read token from stdin")?;
@@ -331,6 +338,22 @@ fn prompt_session_token() -> Result<String> {
     }
 
     Ok(token)
+}
+
+/// Save a session token without downloading anything.
+///
+/// Token source, in order: --token flag, LK_CLOUD_TOKEN, stdin (piped or typed).
+fn cmd_login(flag_token: Option<&str>) -> Result<()> {
+    let token = match flag_token {
+        Some(t) if !t.trim().is_empty() => t.trim().to_string(),
+        _ => match std::env::var("LK_CLOUD_TOKEN") {
+            Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
+            _ => prompt_session_token()?,
+        },
+    };
+    save_session_token(&token)?;
+    eprintln!("Token saved to {}", token_path().display());
+    Ok(())
 }
 
 /// Resolve session token: --token flag > LK_CLOUD_TOKEN env > saved file > interactive prompt.
@@ -570,11 +593,12 @@ pub enum CloudCommand {
     Sessions { limit: u32, page: u32, json: bool },
     Info { session_id: String },
     Download { session_id: String, output: Option<PathBuf> },
+    Login,
 }
 
 pub fn parse_cloud_args(args: &[String]) -> Result<CloudOptions, String> {
     if args.is_empty() {
-        return Err("Missing cloud subcommand. Use: projects, sessions, info, download".to_string());
+        return Err("Missing cloud subcommand. Use: projects, sessions, info, download, login".to_string());
     }
 
     let mut project_name: Option<String> = None;
@@ -660,11 +684,12 @@ pub fn parse_cloud_args(args: &[String]) -> Result<CloudOptions, String> {
                 .clone();
             CloudCommand::Download { session_id, output }
         }
+        "login" | "auth" => CloudCommand::Login,
         "help" | "--help" | "-h" => {
             return Err("show_help".to_string());
         }
         _ => {
-            return Err(format!("Unknown cloud command: '{}'. Use: projects, sessions, info, download", subcmd));
+            return Err(format!("Unknown cloud command: '{}'. Use: projects, sessions, info, download, login", subcmd));
         }
     };
 
@@ -686,6 +711,7 @@ pub fn print_cloud_help() {
     eprintln!("  sessions                      List recent sessions");
     eprintln!("  info <SESSION_ID>             Show session details");
     eprintln!("  download <SESSION_ID>         Download observability data (experimental)");
+    eprintln!("  login                         Save a session token for downloads");
     eprintln!();
     eprintln!("Options:");
     eprintln!("  -p, --project <NAME>          Project name (default: from config)");
@@ -701,12 +727,21 @@ pub fn print_cloud_help() {
     eprintln!("  livekit-analyzer cloud sessions --json");
     eprintln!("  livekit-analyzer cloud info RM_bMvTTdAVKvmW");
     eprintln!("  livekit-analyzer cloud download RM_bMvTTdAVKvmW -o ./session-data");
+    eprintln!("  livekit-analyzer cloud login                       # paste the token");
+    eprintln!("  livekit-analyzer cloud login --token \"$T\"           # or pass it");
+    eprintln!("  pbpaste | livekit-analyzer cloud login              # or pipe it");
 }
 
 pub fn run(options: CloudOptions) -> Result<()> {
+    // login only writes the token file, it needs no project config
+    if matches!(options.command, CloudCommand::Login) {
+        return cmd_login(options.session_token.as_deref());
+    }
+
     let config = load_config()?;
 
     match options.command {
+        CloudCommand::Login => unreachable!("handled above"),
         CloudCommand::Projects => {
             cmd_projects(&config);
             Ok(())

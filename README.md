@@ -126,6 +126,9 @@ livekit-analyzer cloud info RM_bMvTTdAVKvmW
 
 # Download observability data
 livekit-analyzer cloud download RM_bMvTTdAVKvmW -o ./session-data
+
+# Save a session token without downloading anything
+livekit-analyzer cloud login
 ```
 
 ### Download Authentication
@@ -156,6 +159,13 @@ livekit-analyzer cloud download RM_xxx --token <TOKEN>
 # Via environment variable
 export LK_CLOUD_TOKEN=<TOKEN>
 livekit-analyzer cloud download RM_xxx
+```
+
+To save a token up front, in a script or any other non-interactive context, use
+`cloud login` instead of letting `download` prompt:
+```bash
+livekit-analyzer cloud login --token "$T"
+pbpaste | livekit-analyzer cloud login
 ```
 
 ### Full Workflow Example
