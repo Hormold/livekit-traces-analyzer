@@ -26,7 +26,11 @@ pub fn analyze_call(folder: &Path) -> Result<CallAnalysis> {
 
     let chat_file = files.iter().find(|f| f.file_name().to_string_lossy().contains("chat_history"));
     let logs_file = files.iter().find(|f| f.file_name().to_string_lossy().contains("logs"));
-    let traces_file = files.iter().find(|f| f.file_name().to_string_lossy().contains("traces"));
+    // `cloud download` saves the traces as spans.json; a raw dashboard export names them *_traces.json.
+    let traces_file = files.iter().find(|f| {
+        let name = f.file_name().to_string_lossy().into_owned();
+        name.contains("traces") || name.contains("spans")
+    });
 
     // Parse chat history
     if let Some(file) = chat_file {
